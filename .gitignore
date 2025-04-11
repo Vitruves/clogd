@@ -1,0 +1,4 @@
+data/raw/ZINC-11M.csv
+data/raw/output-test.csv
+.venv/
+.p39/
