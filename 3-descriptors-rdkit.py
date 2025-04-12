@@ -66,6 +66,80 @@ def update_progress(progress, description="Computing"):
     sys.stdout.write(f"\r-- [ {progress:6.2f}% ] {description}")
     sys.stdout.flush()
 
+def get_available_descriptors():
+    descriptors = {
+        "2d": {
+            "basic": [x[0] for x in Descriptors._descList],
+            "lipinski": ["NumHDonors", "NumHAcceptors", "NumRotatableBonds", "HeavyAtomCount", "FractionCSP3"],
+            "qed": ["QED", "QED_MW", "QED_ALOGP", "QED_HBA", "QED_HBD", "QED_PSA", "QED_ROTB", "QED_AROM", "QED_ALERTS"],
+            "crippen": ["Crippen_LogP", "Crippen_MR"],
+            "topology": ["ExactMolWt", "FractionCSP3", "TPSA", "NumRotatableBonds", "NumHBD", "NumHBA", 
+                        "NumLipinskiHBD", "NumLipinskiHBA", "NumHeavyAtoms", "NumHeteroatoms", "NumAtoms"],
+            "rings": ["NumRings", "NumAromaticRings", "NumSaturatedRings", "NumAliphaticRings", 
+                     "NumAromaticHeterocycles", "NumAromaticCarbocycles", "NumSaturatedHeterocycles", 
+                     "NumSaturatedCarbocycles", "NumAliphaticHeterocycles", "NumAliphaticCarbocycles"],
+            "stereo": ["NumAtomStereoCenters", "NumUnspecifiedAtomStereoCenters"],
+            "fragments": ["NumAmideBonds", "NumSpiroAtoms", "NumBridgeheadAtoms"],
+            "connectivity": ["HallKierAlpha", "Kappa1", "Kappa2", "Kappa3", 
+                           "Chi0v", "Chi0n", "Chi1v", "Chi1n", "Chi2v", "Chi2n", 
+                           "Chi3v", "Chi3n", "Chi4v", "Chi4n", "Phi", "LabuteASA"],
+            "vsa": ["SlogP_VSA", "SMR_VSA", "PEOE_VSA"],
+            "charges": ["GasteigerMin", "GasteigerMax", "GasteigerMean", "GasteigerStd"],
+            "fingerprints": ["Morgan2_Count", "Morgan2_Density", "Morgan3_Count", "Morgan3_Density", 
+                            "AtomPair_Count", "TopologicalTorsion_Count", "RDKit_Count", "RDKit_Density", 
+                            "MACCS_Count", "MACCS_Density"],
+            "estate": ["EState_VSA", "EStateMin", "EStateMax", "EStateMean", "EStateStd"],
+            "fragments_count": ["amide", "acid", "alcohol", "aldehyde", "ketone", "ether", "ester", 
+                               "phenol", "thioether", "sulfonamide", "sulfoxide", "thiocarbonyl", 
+                               "sulfonyl", "amine", "nitrile", "nitro", "azide", "halogen", 
+                               "aromatic", "heterocycle", "bicyclic", "chiral_center"]
+        },
+        "3d": {
+            "shape": ["NPR1", "NPR2", "PMI1", "PMI2", "PMI3", "RadiusOfGyration", 
+                     "InertialShapeFactor", "Eccentricity", "Asphericity", "SpherocityIndex"],
+            "autocorr3d": ["AUTOCORR3D"],
+            "rdf": ["RDF"],
+            "morse": ["MORSE"],
+            "whim": ["WHIM"],
+            "getaway": ["GETAWAY"],
+            "coulomb": ["CoulombMatSize", "CoulombMatMax", "CoulombMatMin", "CoulombMatMean"],
+            "charges3d": ["EEM_Min", "EEM_Max", "EEM_Mean", "EEM_Std"],
+            "volume": ["MolVolume"],
+            "usr": ["USR", "USRCAT"],
+            "oxidation": ["OxidationNum_Min", "OxidationNum_Max", "OxidationNum_Mean", "OxidationNum_Std"],
+            "surface": ["SurfaceArea"]
+        }
+    }
+    return descriptors
+
+def print_available_descriptors():
+    descriptors = get_available_descriptors()
+    
+    print_message("Available RDKit Descriptors:")
+    print_message("============================")
+    
+    print_message("\n2D Descriptors:")
+    for category, desc_list in descriptors["2d"].items():
+        print_message(f"  {category} ({len(desc_list)})")
+        for i, desc in enumerate(desc_list):
+            if i < 10 or i > len(desc_list) - 3:
+                print_message(f"    - {desc}")
+            elif i == 10:
+                print_message(f"    - ... ({len(desc_list) - 13} more)")
+    
+    print_message("\n3D Descriptors:")
+    for category, desc_list in descriptors["3d"].items():
+        print_message(f"  {category} ({len(desc_list)})")
+        for desc in desc_list:
+            print_message(f"    - {desc}")
+    
+    print_message("\nUsage Examples:")
+    print_message("  --compute 2d                # All 2D descriptors")
+    print_message("  --compute 3d                # All 3D descriptors")
+    print_message("  --compute all               # All descriptors")
+    print_message("  --compute basic,fingerprints # Specific categories")
+    print_message("  --compute NumHDonors,TPSA,Morgan2_Count # Specific descriptors")
+
 class ProgressTracker:
     def __init__(self, total_steps, description="Computing"):
         self.total_steps = total_steps
@@ -128,7 +202,7 @@ def prepare_3d_molecule(mol):
         return None
 
 def compute_rdkit_descriptors(mol_data):
-    smiles, compute_3d, prefix, idx = mol_data
+    smiles, compute_3d, prefix, idx, compute_descriptors = mol_data
     
     try:
         mol = Chem.MolFromSmiles(smiles)
@@ -136,365 +210,455 @@ def compute_rdkit_descriptors(mol_data):
             return idx, {}, smiles
         
         result_dict = {}
+        available_descriptors = get_available_descriptors()
+        descriptors_to_compute = set()
+        
+        if compute_descriptors == "all":
+            for dimension in ["2d", "3d"]:
+                for category in available_descriptors[dimension]:
+                    descriptors_to_compute.update(available_descriptors[dimension][category])
+        elif compute_descriptors == "2d":
+            for category in available_descriptors["2d"]:
+                descriptors_to_compute.update(available_descriptors["2d"][category])
+        elif compute_descriptors == "3d":
+            for category in available_descriptors["3d"]:
+                descriptors_to_compute.update(available_descriptors["3d"][category])
+        elif compute_descriptors:
+            categories = compute_descriptors.split(",")
+            for category in categories:
+                category = category.strip()
+                found = False
+                
+                for dimension in ["2d", "3d"]:
+                    if category in available_descriptors[dimension]:
+                        descriptors_to_compute.update(available_descriptors[dimension][category])
+                        found = True
+                
+                if not found:
+                    descriptors_to_compute.add(category)
+        
+        compute_all = not compute_descriptors or compute_descriptors == "all" or compute_descriptors == "2d"
+        compute_all_3d = not compute_descriptors or compute_descriptors == "all" or compute_descriptors == "3d"
         
         # 1. Basic molecular properties from standard RDKit descriptors
-        calc = MoleculeDescriptors.MolecularDescriptorCalculator([x[0] for x in Descriptors._descList])
-        basic_descriptors = calc.CalcDescriptors(mol)
-        for i, name in enumerate([x[0] for x in Descriptors._descList]):
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["basic"]):
+            calc = MoleculeDescriptors.MolecularDescriptorCalculator([x[0] for x in Descriptors._descList])
+            basic_descriptors = calc.CalcDescriptors(mol)
+            for i, name in enumerate([x[0] for x in Descriptors._descList]):
+                if compute_all or name in descriptors_to_compute:
+                    try:
+                        value = basic_descriptors[i]
+                        if value is not None and not np.isnan(value):
+                            result_dict[f"{prefix}_{name}"] = float(value)
+                    except:
+                        pass
+        
+        # 2. Lipinski properties
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["lipinski"]):
             try:
-                value = basic_descriptors[i]
-                if value is not None and not np.isnan(value):
-                    result_dict[f"{prefix}_{name}"] = float(value)
+                if compute_all or "NumHDonors" in descriptors_to_compute:
+                    result_dict[f"{prefix}_NumHDonors"] = Lipinski.NumHDonors(mol)
+                if compute_all or "NumHAcceptors" in descriptors_to_compute:
+                    result_dict[f"{prefix}_NumHAcceptors"] = Lipinski.NumHAcceptors(mol)
+                if compute_all or "NumRotatableBonds" in descriptors_to_compute:
+                    result_dict[f"{prefix}_NumRotatableBonds"] = Lipinski.NumRotatableBonds(mol)
+                if compute_all or "HeavyAtomCount" in descriptors_to_compute:
+                    result_dict[f"{prefix}_HeavyAtomCount"] = Lipinski.HeavyAtomCount(mol)
+                if compute_all or "FractionCSP3" in descriptors_to_compute:
+                    result_dict[f"{prefix}_FractionCSP3"] = Lipinski.FractionCSP3(mol)
             except:
                 pass
         
-        # 2. Lipinski properties
-        try:
-            result_dict[f"{prefix}_NumHDonors"] = Lipinski.NumHDonors(mol)
-            result_dict[f"{prefix}_NumHAcceptors"] = Lipinski.NumHAcceptors(mol)
-            result_dict[f"{prefix}_NumRotatableBonds"] = Lipinski.NumRotatableBonds(mol)
-            result_dict[f"{prefix}_HeavyAtomCount"] = Lipinski.HeavyAtomCount(mol)
-            result_dict[f"{prefix}_FractionCSP3"] = Lipinski.FractionCSP3(mol)
-        except:
-            pass
-        
         # 3. QED (Quantitative Estimate of Drug-likeness) properties
-        try:
-            qed_props = QED.properties(mol)
-            result_dict[f"{prefix}_QED"] = QED.qed(mol)
-            result_dict[f"{prefix}_QED_MW"] = qed_props.MW
-            result_dict[f"{prefix}_QED_ALOGP"] = qed_props.ALOGP
-            result_dict[f"{prefix}_QED_HBA"] = qed_props.HBA
-            result_dict[f"{prefix}_QED_HBD"] = qed_props.HBD
-            result_dict[f"{prefix}_QED_PSA"] = qed_props.PSA
-            result_dict[f"{prefix}_QED_ROTB"] = qed_props.ROTB
-            result_dict[f"{prefix}_QED_AROM"] = qed_props.AROM
-            result_dict[f"{prefix}_QED_ALERTS"] = qed_props.ALERTS
-        except:
-            pass
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["qed"]):
+            try:
+                qed_props = QED.properties(mol)
+                if compute_all or "QED" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED"] = QED.qed(mol)
+                if compute_all or "QED_MW" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_MW"] = qed_props.MW
+                if compute_all or "QED_ALOGP" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_ALOGP"] = qed_props.ALOGP
+                if compute_all or "QED_HBA" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_HBA"] = qed_props.HBA
+                if compute_all or "QED_HBD" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_HBD"] = qed_props.HBD
+                if compute_all or "QED_PSA" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_PSA"] = qed_props.PSA
+                if compute_all or "QED_ROTB" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_ROTB"] = qed_props.ROTB
+                if compute_all or "QED_AROM" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_AROM"] = qed_props.AROM
+                if compute_all or "QED_ALERTS" in descriptors_to_compute:
+                    result_dict[f"{prefix}_QED_ALERTS"] = qed_props.ALERTS
+            except:
+                pass
         
         # 4. Crippen descriptors
-        try:
-            result_dict[f"{prefix}_Crippen_LogP"] = Crippen.MolLogP(mol)
-            result_dict[f"{prefix}_Crippen_MR"] = Crippen.MolMR(mol)
-        except:
-            pass
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["crippen"]):
+            try:
+                if compute_all or "Crippen_LogP" in descriptors_to_compute:
+                    result_dict[f"{prefix}_Crippen_LogP"] = Crippen.MolLogP(mol)
+                if compute_all or "Crippen_MR" in descriptors_to_compute:
+                    result_dict[f"{prefix}_Crippen_MR"] = Crippen.MolMR(mol)
+            except:
+                pass
         
         # 5. rdMolDescriptors - topological and functional group counts
-        try:
-            # Basic molecular properties
-            result_dict[f"{prefix}_ExactMolWt"] = rdMolDescriptors.CalcExactMolWt(mol)
-            result_dict[f"{prefix}_FractionCSP3"] = rdMolDescriptors.CalcFractionCSP3(mol)
-            result_dict[f"{prefix}_TPSA"] = rdMolDescriptors.CalcTPSA(mol)
-            result_dict[f"{prefix}_NumRotatableBonds"] = rdMolDescriptors.CalcNumRotatableBonds(mol)
-            result_dict[f"{prefix}_NumHBD"] = rdMolDescriptors.CalcNumHBD(mol)
-            result_dict[f"{prefix}_NumHBA"] = rdMolDescriptors.CalcNumHBA(mol)
-            result_dict[f"{prefix}_NumLipinskiHBD"] = rdMolDescriptors.CalcNumLipinskiHBD(mol)
-            result_dict[f"{prefix}_NumLipinskiHBA"] = rdMolDescriptors.CalcNumLipinskiHBA(mol)
-            result_dict[f"{prefix}_NumHeavyAtoms"] = rdMolDescriptors.CalcNumHeavyAtoms(mol)
-            result_dict[f"{prefix}_NumHeteroatoms"] = rdMolDescriptors.CalcNumHeteroatoms(mol)
-            result_dict[f"{prefix}_NumAtoms"] = rdMolDescriptors.CalcNumAtoms(mol)
-            
-            # Ring properties
-            result_dict[f"{prefix}_NumRings"] = rdMolDescriptors.CalcNumRings(mol)
-            result_dict[f"{prefix}_NumAromaticRings"] = rdMolDescriptors.CalcNumAromaticRings(mol)
-            result_dict[f"{prefix}_NumSaturatedRings"] = rdMolDescriptors.CalcNumSaturatedRings(mol)
-            result_dict[f"{prefix}_NumAliphaticRings"] = rdMolDescriptors.CalcNumAliphaticRings(mol)
-            result_dict[f"{prefix}_NumAromaticHeterocycles"] = rdMolDescriptors.CalcNumAromaticHeterocycles(mol)
-            result_dict[f"{prefix}_NumAromaticCarbocycles"] = rdMolDescriptors.CalcNumAromaticCarbocycles(mol)
-            result_dict[f"{prefix}_NumSaturatedHeterocycles"] = rdMolDescriptors.CalcNumSaturatedHeterocycles(mol)
-            result_dict[f"{prefix}_NumSaturatedCarbocycles"] = rdMolDescriptors.CalcNumSaturatedCarbocycles(mol)
-            result_dict[f"{prefix}_NumAliphaticHeterocycles"] = rdMolDescriptors.CalcNumAliphaticHeterocycles(mol)
-            result_dict[f"{prefix}_NumAliphaticCarbocycles"] = rdMolDescriptors.CalcNumAliphaticCarbocycles(mol)
-            
-            # Stereo properties
-            result_dict[f"{prefix}_NumAtomStereoCenters"] = rdMolDescriptors.CalcNumAtomStereoCenters(mol)
-            result_dict[f"{prefix}_NumUnspecifiedAtomStereoCenters"] = rdMolDescriptors.CalcNumUnspecifiedAtomStereoCenters(mol)
-            
-            # Special atom counts
-            result_dict[f"{prefix}_NumAmideBonds"] = rdMolDescriptors.CalcNumAmideBonds(mol)
-            result_dict[f"{prefix}_NumSpiroAtoms"] = rdMolDescriptors.CalcNumSpiroAtoms(mol)
-            result_dict[f"{prefix}_NumBridgeheadAtoms"] = rdMolDescriptors.CalcNumBridgeheadAtoms(mol)
-            
-            # Hall-Kier Alpha value
-            result_dict[f"{prefix}_HallKierAlpha"] = rdMolDescriptors.CalcHallKierAlpha(mol)
-            
-            # Kappa descriptors
-            result_dict[f"{prefix}_Kappa1"] = rdMolDescriptors.CalcKappa1(mol)
-            result_dict[f"{prefix}_Kappa2"] = rdMolDescriptors.CalcKappa2(mol)
-            result_dict[f"{prefix}_Kappa3"] = rdMolDescriptors.CalcKappa3(mol)
-            
-            # Chi connectivity descriptors
-            result_dict[f"{prefix}_Chi0v"] = rdMolDescriptors.CalcChi0v(mol)
-            result_dict[f"{prefix}_Chi0n"] = rdMolDescriptors.CalcChi0n(mol)
-            result_dict[f"{prefix}_Chi1v"] = rdMolDescriptors.CalcChi1v(mol)
-            result_dict[f"{prefix}_Chi1n"] = rdMolDescriptors.CalcChi1n(mol)
-            result_dict[f"{prefix}_Chi2v"] = rdMolDescriptors.CalcChi2v(mol)
-            result_dict[f"{prefix}_Chi2n"] = rdMolDescriptors.CalcChi2n(mol)
-            result_dict[f"{prefix}_Chi3v"] = rdMolDescriptors.CalcChi3v(mol)
-            result_dict[f"{prefix}_Chi3n"] = rdMolDescriptors.CalcChi3n(mol)
-            result_dict[f"{prefix}_Chi4v"] = rdMolDescriptors.CalcChi4v(mol)
-            result_dict[f"{prefix}_Chi4n"] = rdMolDescriptors.CalcChi4n(mol)
-            
-            # Phi
-            result_dict[f"{prefix}_Phi"] = rdMolDescriptors.CalcPhi(mol)
-            
-            # Labute ASA
-            result_dict[f"{prefix}_LabuteASA"] = rdMolDescriptors.CalcLabuteASA(mol)
-            
-            # Molecular formula
-            result_dict[f"{prefix}_MolFormula"] = rdMolDescriptors.CalcMolFormula(mol)
-            
-            # BCUT2D descriptors
-            bcuts = rdMolDescriptors.BCUT2D(mol)
-            if len(bcuts) >= 6:
-                result_dict[f"{prefix}_BCUT2D_MWLOW"] = bcuts[0]
-                result_dict[f"{prefix}_BCUT2D_MWHIGH"] = bcuts[1]
-                result_dict[f"{prefix}_BCUT2D_CHGLOW"] = bcuts[2]
-                result_dict[f"{prefix}_BCUT2D_CHGHIGH"] = bcuts[3]
-                result_dict[f"{prefix}_BCUT2D_LOGPLOW"] = bcuts[4]
-                result_dict[f"{prefix}_BCUT2D_LOGPHIGH"] = bcuts[5]
-            
-            # VSA descriptors
-            slogp_vsa = rdMolDescriptors.SlogP_VSA_(mol)
-            smr_vsa = rdMolDescriptors.SMR_VSA_(mol)
-            peoe_vsa = rdMolDescriptors.PEOE_VSA_(mol)
-            
-            for i, value in enumerate(slogp_vsa):
-                result_dict[f"{prefix}_SlogP_VSA{i+1}"] = value
-            
-            for i, value in enumerate(smr_vsa):
-                result_dict[f"{prefix}_SMR_VSA{i+1}"] = value
-            
-            for i, value in enumerate(peoe_vsa):
-                result_dict[f"{prefix}_PEOE_VSA{i+1}"] = value
-            
-            # MQNs (Molecular Quantum Numbers) descriptors
-            mqns = rdMolDescriptors.MQNs_(mol)
-            for i, value in enumerate(mqns):
-                result_dict[f"{prefix}_MQN{i+1}"] = value
-            
-            # Autocorrelation descriptors
-            autocorr2d = rdMolDescriptors.CalcAUTOCORR2D(mol)
-            for i, value in enumerate(autocorr2d):
-                result_dict[f"{prefix}_AUTOCORR2D_{i+1}"] = value
-        except:
-            pass
+        if compute_all:
+            try:
+                # Basic molecular properties
+                result_dict[f"{prefix}_ExactMolWt"] = rdMolDescriptors.CalcExactMolWt(mol)
+                result_dict[f"{prefix}_FractionCSP3"] = rdMolDescriptors.CalcFractionCSP3(mol)
+                result_dict[f"{prefix}_TPSA"] = rdMolDescriptors.CalcTPSA(mol)
+                result_dict[f"{prefix}_NumRotatableBonds"] = rdMolDescriptors.CalcNumRotatableBonds(mol)
+                result_dict[f"{prefix}_NumHBD"] = rdMolDescriptors.CalcNumHBD(mol)
+                result_dict[f"{prefix}_NumHBA"] = rdMolDescriptors.CalcNumHBA(mol)
+                result_dict[f"{prefix}_NumLipinskiHBD"] = rdMolDescriptors.CalcNumLipinskiHBD(mol)
+                result_dict[f"{prefix}_NumLipinskiHBA"] = rdMolDescriptors.CalcNumLipinskiHBA(mol)
+                result_dict[f"{prefix}_NumHeavyAtoms"] = rdMolDescriptors.CalcNumHeavyAtoms(mol)
+                result_dict[f"{prefix}_NumHeteroatoms"] = rdMolDescriptors.CalcNumHeteroatoms(mol)
+                result_dict[f"{prefix}_NumAtoms"] = rdMolDescriptors.CalcNumAtoms(mol)
+                
+                # Ring properties
+                result_dict[f"{prefix}_NumRings"] = rdMolDescriptors.CalcNumRings(mol)
+                result_dict[f"{prefix}_NumAromaticRings"] = rdMolDescriptors.CalcNumAromaticRings(mol)
+                result_dict[f"{prefix}_NumSaturatedRings"] = rdMolDescriptors.CalcNumSaturatedRings(mol)
+                result_dict[f"{prefix}_NumAliphaticRings"] = rdMolDescriptors.CalcNumAliphaticRings(mol)
+                result_dict[f"{prefix}_NumAromaticHeterocycles"] = rdMolDescriptors.CalcNumAromaticHeterocycles(mol)
+                result_dict[f"{prefix}_NumAromaticCarbocycles"] = rdMolDescriptors.CalcNumAromaticCarbocycles(mol)
+                result_dict[f"{prefix}_NumSaturatedHeterocycles"] = rdMolDescriptors.CalcNumSaturatedHeterocycles(mol)
+                result_dict[f"{prefix}_NumSaturatedCarbocycles"] = rdMolDescriptors.CalcNumSaturatedCarbocycles(mol)
+                result_dict[f"{prefix}_NumAliphaticHeterocycles"] = rdMolDescriptors.CalcNumAliphaticHeterocycles(mol)
+                result_dict[f"{prefix}_NumAliphaticCarbocycles"] = rdMolDescriptors.CalcNumAliphaticCarbocycles(mol)
+                
+                # Stereo properties
+                result_dict[f"{prefix}_NumAtomStereoCenters"] = rdMolDescriptors.CalcNumAtomStereoCenters(mol)
+                result_dict[f"{prefix}_NumUnspecifiedAtomStereoCenters"] = rdMolDescriptors.CalcNumUnspecifiedAtomStereoCenters(mol)
+                
+                # Special atom counts
+                result_dict[f"{prefix}_NumAmideBonds"] = rdMolDescriptors.CalcNumAmideBonds(mol)
+                result_dict[f"{prefix}_NumSpiroAtoms"] = rdMolDescriptors.CalcNumSpiroAtoms(mol)
+                result_dict[f"{prefix}_NumBridgeheadAtoms"] = rdMolDescriptors.CalcNumBridgeheadAtoms(mol)
+                
+                # Hall-Kier Alpha value
+                result_dict[f"{prefix}_HallKierAlpha"] = rdMolDescriptors.CalcHallKierAlpha(mol)
+                
+                # Kappa descriptors
+                result_dict[f"{prefix}_Kappa1"] = rdMolDescriptors.CalcKappa1(mol)
+                result_dict[f"{prefix}_Kappa2"] = rdMolDescriptors.CalcKappa2(mol)
+                result_dict[f"{prefix}_Kappa3"] = rdMolDescriptors.CalcKappa3(mol)
+                
+                # Chi connectivity descriptors
+                result_dict[f"{prefix}_Chi0v"] = rdMolDescriptors.CalcChi0v(mol)
+                result_dict[f"{prefix}_Chi0n"] = rdMolDescriptors.CalcChi0n(mol)
+                result_dict[f"{prefix}_Chi1v"] = rdMolDescriptors.CalcChi1v(mol)
+                result_dict[f"{prefix}_Chi1n"] = rdMolDescriptors.CalcChi1n(mol)
+                result_dict[f"{prefix}_Chi2v"] = rdMolDescriptors.CalcChi2v(mol)
+                result_dict[f"{prefix}_Chi2n"] = rdMolDescriptors.CalcChi2n(mol)
+                result_dict[f"{prefix}_Chi3v"] = rdMolDescriptors.CalcChi3v(mol)
+                result_dict[f"{prefix}_Chi3n"] = rdMolDescriptors.CalcChi3n(mol)
+                result_dict[f"{prefix}_Chi4v"] = rdMolDescriptors.CalcChi4v(mol)
+                result_dict[f"{prefix}_Chi4n"] = rdMolDescriptors.CalcChi4n(mol)
+                
+                # Phi
+                result_dict[f"{prefix}_Phi"] = rdMolDescriptors.CalcPhi(mol)
+                
+                # Labute ASA
+                result_dict[f"{prefix}_LabuteASA"] = rdMolDescriptors.CalcLabuteASA(mol)
+                
+                # Molecular formula
+                result_dict[f"{prefix}_MolFormula"] = rdMolDescriptors.CalcMolFormula(mol)
+                
+                # BCUT2D descriptors
+                bcuts = rdMolDescriptors.BCUT2D(mol)
+                if len(bcuts) >= 6:
+                    result_dict[f"{prefix}_BCUT2D_MWLOW"] = bcuts[0]
+                    result_dict[f"{prefix}_BCUT2D_MWHIGH"] = bcuts[1]
+                    result_dict[f"{prefix}_BCUT2D_CHGLOW"] = bcuts[2]
+                    result_dict[f"{prefix}_BCUT2D_CHGHIGH"] = bcuts[3]
+                    result_dict[f"{prefix}_BCUT2D_LOGPLOW"] = bcuts[4]
+                    result_dict[f"{prefix}_BCUT2D_LOGPHIGH"] = bcuts[5]
+                
+                # VSA descriptors
+                slogp_vsa = rdMolDescriptors.SlogP_VSA_(mol)
+                smr_vsa = rdMolDescriptors.SMR_VSA_(mol)
+                peoe_vsa = rdMolDescriptors.PEOE_VSA_(mol)
+                
+                for i, value in enumerate(slogp_vsa):
+                    result_dict[f"{prefix}_SlogP_VSA{i+1}"] = value
+                
+                for i, value in enumerate(smr_vsa):
+                    result_dict[f"{prefix}_SMR_VSA{i+1}"] = value
+                
+                for i, value in enumerate(peoe_vsa):
+                    result_dict[f"{prefix}_PEOE_VSA{i+1}"] = value
+                
+                # MQNs (Molecular Quantum Numbers) descriptors
+                mqns = rdMolDescriptors.MQNs_(mol)
+                for i, value in enumerate(mqns):
+                    result_dict[f"{prefix}_MQN{i+1}"] = value
+                
+                # Autocorrelation descriptors
+                autocorr2d = rdMolDescriptors.CalcAUTOCORR2D(mol)
+                for i, value in enumerate(autocorr2d):
+                    result_dict[f"{prefix}_AUTOCORR2D_{i+1}"] = value
+            except:
+                pass
         
         # 6. Partial charges
-        try:
-            Chem.rdPartialCharges.ComputeGasteigerCharges(mol)
-            charges = [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()]
-            if charges:
-                result_dict[f"{prefix}_GasteigerMin"] = min(charges)
-                result_dict[f"{prefix}_GasteigerMax"] = max(charges)
-                result_dict[f"{prefix}_GasteigerMean"] = sum(charges) / len(charges)
-                result_dict[f"{prefix}_GasteigerStd"] = np.std(charges)
-        except:
-            pass
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["charges"]):
+            try:
+                Chem.rdPartialCharges.ComputeGasteigerCharges(mol)
+                charges = [atom.GetDoubleProp("_GasteigerCharge") for atom in mol.GetAtoms()]
+                if charges:
+                    if compute_all or "GasteigerMin" in descriptors_to_compute:
+                        result_dict[f"{prefix}_GasteigerMin"] = min(charges)
+                    if compute_all or "GasteigerMax" in descriptors_to_compute:
+                        result_dict[f"{prefix}_GasteigerMax"] = max(charges)
+                    if compute_all or "GasteigerMean" in descriptors_to_compute:
+                        result_dict[f"{prefix}_GasteigerMean"] = sum(charges) / len(charges)
+                    if compute_all or "GasteigerStd" in descriptors_to_compute:
+                        result_dict[f"{prefix}_GasteigerStd"] = np.std(charges)
+            except:
+                pass
         
         # 7. Fingerprints using the new recommended generators (fixes deprecation warnings)
-        try:
-            # Morgan fingerprints
-            morgan_gen = GetMorganGenerator(radius=2, fpSize=2048)
-            morgan_fp = morgan_gen.GetFingerprint(mol)
-            result_dict[f"{prefix}_Morgan2_Count"] = morgan_fp.GetNumOnBits()
-            result_dict[f"{prefix}_Morgan2_Density"] = morgan_fp.GetNumOnBits() / 2048.0
-            
-            # Morgan fingerprints radius 3
-            morgan_gen3 = GetMorganGenerator(radius=3, fpSize=2048)
-            morgan_fp3 = morgan_gen3.GetFingerprint(mol)
-            result_dict[f"{prefix}_Morgan3_Count"] = morgan_fp3.GetNumOnBits()
-            result_dict[f"{prefix}_Morgan3_Density"] = morgan_fp3.GetNumOnBits() / 2048.0
-            
-            # Atom pair fingerprints
-            ap_gen = GetAtomPairGenerator()
-            ap_fp = ap_gen.GetSparseCountFingerprint(mol)
-            result_dict[f"{prefix}_AtomPair_Count"] = len(ap_fp.GetNonzeroElements())
-            
-            # Topological torsion fingerprints
-            tt_gen = GetTopologicalTorsionGenerator()
-            tt_fp = tt_gen.GetSparseCountFingerprint(mol)
-            result_dict[f"{prefix}_TopologicalTorsion_Count"] = len(tt_fp.GetNonzeroElements())
-            
-            # RDKit fingerprints
-            rdkit_gen = GetRDKitFPGenerator(fpSize=2048)
-            rdkit_fp = rdkit_gen.GetFingerprint(mol)
-            result_dict[f"{prefix}_RDKit_Count"] = rdkit_fp.GetNumOnBits()
-            result_dict[f"{prefix}_RDKit_Density"] = rdkit_fp.GetNumOnBits() / 2048.0
-            
-            # MACCS Keys
-            maccs_fp = Chem.rdMolDescriptors.GetMACCSKeysFingerprint(mol)
-            result_dict[f"{prefix}_MACCS_Count"] = maccs_fp.GetNumOnBits()
-            result_dict[f"{prefix}_MACCS_Density"] = maccs_fp.GetNumOnBits() / 166.0
-        except:
-            pass
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["fingerprints"]):
+            try:
+                # Morgan fingerprints
+                morgan_gen = GetMorganGenerator(radius=2, fpSize=2048)
+                morgan_fp = morgan_gen.GetFingerprint(mol)
+                if compute_all or "Morgan2_Count" in descriptors_to_compute:
+                    result_dict[f"{prefix}_Morgan2_Count"] = morgan_fp.GetNumOnBits()
+                if compute_all or "Morgan2_Density" in descriptors_to_compute:
+                    result_dict[f"{prefix}_Morgan2_Density"] = morgan_fp.GetNumOnBits() / 2048.0
+                
+                # Morgan fingerprints radius 3
+                morgan_gen3 = GetMorganGenerator(radius=3, fpSize=2048)
+                morgan_fp3 = morgan_gen3.GetFingerprint(mol)
+                if compute_all or "Morgan3_Count" in descriptors_to_compute:
+                    result_dict[f"{prefix}_Morgan3_Count"] = morgan_fp3.GetNumOnBits()
+                if compute_all or "Morgan3_Density" in descriptors_to_compute:
+                    result_dict[f"{prefix}_Morgan3_Density"] = morgan_fp3.GetNumOnBits() / 2048.0
+                
+                # Atom pair fingerprints
+                ap_gen = GetAtomPairGenerator()
+                ap_fp = ap_gen.GetSparseCountFingerprint(mol)
+                if compute_all or "AtomPair_Count" in descriptors_to_compute:
+                    result_dict[f"{prefix}_AtomPair_Count"] = len(ap_fp.GetNonzeroElements())
+                
+                # Topological torsion fingerprints
+                tt_gen = GetTopologicalTorsionGenerator()
+                tt_fp = tt_gen.GetSparseCountFingerprint(mol)
+                if compute_all or "TopologicalTorsion_Count" in descriptors_to_compute:
+                    result_dict[f"{prefix}_TopologicalTorsion_Count"] = len(tt_fp.GetNonzeroElements())
+                
+                # RDKit fingerprints
+                rdkit_gen = GetRDKitFPGenerator(fpSize=2048)
+                rdkit_fp = rdkit_gen.GetFingerprint(mol)
+                if compute_all or "RDKit_Count" in descriptors_to_compute:
+                    result_dict[f"{prefix}_RDKit_Count"] = rdkit_fp.GetNumOnBits()
+                if compute_all or "RDKit_Density" in descriptors_to_compute:
+                    result_dict[f"{prefix}_RDKit_Density"] = rdkit_fp.GetNumOnBits() / 2048.0
+                
+                # MACCS Keys
+                maccs_fp = Chem.rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+                if compute_all or "MACCS_Count" in descriptors_to_compute:
+                    result_dict[f"{prefix}_MACCS_Count"] = maccs_fp.GetNumOnBits()
+                if compute_all or "MACCS_Density" in descriptors_to_compute:
+                    result_dict[f"{prefix}_MACCS_Density"] = maccs_fp.GetNumOnBits() / 166.0
+            except:
+                pass
         
         # 8. EState values and indices
-        try:
-            from rdkit.Chem.EState import EState_VSA
-            estate_vsa = EState_VSA.EState_VSA_(mol)
-            for i, value in enumerate(estate_vsa):
-                result_dict[f"{prefix}_EState_VSA{i+1}"] = value
-            
-            from rdkit.Chem.EState import EState
-            estate_indices = EState.EStateIndices(mol)
-            if estate_indices:
-                result_dict[f"{prefix}_EStateMin"] = min(estate_indices)
-                result_dict[f"{prefix}_EStateMax"] = max(estate_indices)
-                result_dict[f"{prefix}_EStateMean"] = sum(estate_indices) / len(estate_indices)
-                result_dict[f"{prefix}_EStateStd"] = np.std(estate_indices)
-        except:
-            pass
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["estate"]):
+            try:
+                from rdkit.Chem.EState import EState_VSA
+                estate_vsa = EState_VSA.EState_VSA_(mol)
+                for i, value in enumerate(estate_vsa):
+                    result_dict[f"{prefix}_EState_VSA{i+1}"] = value
+                
+                from rdkit.Chem.EState import EState
+                estate_indices = EState.EStateIndices(mol)
+                if estate_indices:
+                    if compute_all or "EStateMin" in descriptors_to_compute:
+                        result_dict[f"{prefix}_EStateMin"] = min(estate_indices)
+                    if compute_all or "EStateMax" in descriptors_to_compute:
+                        result_dict[f"{prefix}_EStateMax"] = max(estate_indices)
+                    if compute_all or "EStateMean" in descriptors_to_compute:
+                        result_dict[f"{prefix}_EStateMean"] = sum(estate_indices) / len(estate_indices)
+                    if compute_all or "EStateStd" in descriptors_to_compute:
+                        result_dict[f"{prefix}_EStateStd"] = np.std(estate_indices)
+            except:
+                pass
         
         # 9. Additional structural information
-        try:
-            # Count fragment types
-            fragments = {
-                "amide": "[NX3,NX4+][CX3](=[OX1])[#6]",
-                "acid": "[OX2H][CX3](=[OX1])[#6]",
-                "alcohol": "[OX2H][CX4;!$(C([OX2H])[O,S,#7,#15])]",
-                "aldehyde": "[CX3H]=[OX1]",
-                "ketone": "[#6][CX3](=[OX1])[#6]",
-                "ether": "[OD2]([#6])[#6]",
-                "ester": "[#6][CX3](=[OX1])[OX2][#6]",
-                "phenol": "[OX2H][cX3]:[c]",
-                "thioether": "[#16X2]([#6])[#6]",
-                "sulfonamide": "[#16X4]([OX1])([OX1])[NX3]",
-                "sulfoxide": "[#16X3][#6]",
-                "thiocarbonyl": "[#6X3]=[#16X1]",
-                "sulfonyl": "[#6][SX4](=[OX1])(=[OX1])[#6]",
-                "amine": "[NX3;H2,H1,H0;!$(NC=[!#6]);!$(NC#[!#6])]",
-                "nitrile": "[NX1]#[CX2]",
-                "nitro": "[$([NX3](=O)=O),$([NX3+](=O)[O-])]",
-                "azide": "[$(*-[NX2-]-[NX2+]#[NX1]),$(*-[NX2]=[NX2+]=[NX1-])]",
-                "halogen": "[F,Cl,Br,I]",
-                "aromatic": "a",
-                "heterocycle": "[!#6;r]",
-                "bicyclic": "[$([*R2]([*R])([*R]))]",
-                "chiral_center": "[*;X4;v4](*)(*)(*)(*)"
-            }
-            
-            for name, smarts in fragments.items():
-                try:
-                    pattern = Chem.MolFromSmarts(smarts)
-                    if pattern:
-                        matches = mol.GetSubstructMatches(pattern)
-                        result_dict[f"{prefix}_Has{name.capitalize()}"] = 1 if matches else 0
-                        result_dict[f"{prefix}_Num{name.capitalize()}"] = len(matches)
-                except:
-                    pass
-            
-            # Atom type counts
-            atom_types = {}
-            for atom in mol.GetAtoms():
-                symbol = atom.GetSymbol()
-                if symbol in atom_types:
-                    atom_types[symbol] += 1
-                else:
-                    atom_types[symbol] = 1
-            
-            for symbol, count in atom_types.items():
-                result_dict[f"{prefix}_Num{symbol}"] = count
-        except:
-            pass
+        if compute_all or any(desc in descriptors_to_compute for desc in available_descriptors["2d"]["fragments_count"]):
+            try:
+                # Count fragment types
+                fragments = {
+                    "amide": "[NX3,NX4+][CX3](=[OX1])[#6]",
+                    "acid": "[OX2H][CX3](=[OX1])[#6]",
+                    "alcohol": "[OX2H][CX4;!$(C([OX2H])[O,S,#7,#15])]",
+                    "aldehyde": "[CX3H]=[OX1]",
+                    "ketone": "[#6][CX3](=[OX1])[#6]",
+                    "ether": "[OD2]([#6])[#6]",
+                    "ester": "[#6][CX3](=[OX1])[OX2][#6]",
+                    "phenol": "[OX2H][cX3]:[c]",
+                    "thioether": "[#16X2]([#6])[#6]",
+                    "sulfonamide": "[#16X4]([OX1])([OX1])[NX3]",
+                    "sulfoxide": "[#16X3][#6]",
+                    "thiocarbonyl": "[#6X3]=[#16X1]",
+                    "sulfonyl": "[#6][SX4](=[OX1])(=[OX1])[#6]",
+                    "amine": "[NX3;H2,H1,H0;!$(NC=[!#6]);!$(NC#[!#6])]",
+                    "nitrile": "[NX1]#[CX2]",
+                    "nitro": "[$([NX3](=O)=O),$([NX3+](=O)[O-])]",
+                    "azide": "[$(*-[NX2-]-[NX2+]#[NX1]),$(*-[NX2]=[NX2+]=[NX1-])]",
+                    "halogen": "[F,Cl,Br,I]",
+                    "aromatic": "a",
+                    "heterocycle": "[!#6;r]",
+                    "bicyclic": "[$([*R2]([*R])([*R]))]",
+                    "chiral_center": "[*;X4;v4](*)(*)(*)(*)"
+                }
+                
+                for name, smarts in fragments.items():
+                    if compute_all or name in descriptors_to_compute:
+                        try:
+                            pattern = Chem.MolFromSmarts(smarts)
+                            if pattern:
+                                matches = mol.GetSubstructMatches(pattern)
+                                result_dict[f"{prefix}_Has{name.capitalize()}"] = 1 if matches else 0
+                                result_dict[f"{prefix}_Num{name.capitalize()}"] = len(matches)
+                        except:
+                            pass
+                
+                # Atom type counts
+                atom_types = {}
+                for atom in mol.GetAtoms():
+                    symbol = atom.GetSymbol()
+                    if symbol in atom_types:
+                        atom_types[symbol] += 1
+                    else:
+                        atom_types[symbol] = 1
+                
+                for symbol, count in atom_types.items():
+                    result_dict[f"{prefix}_Num{symbol}"] = count
+            except:
+                pass
         
         # 10. 3D descriptors if requested
-        if compute_3d:
+        if compute_3d and (compute_all_3d or any(desc in descriptors_to_compute for dimension in ["3d"] for desc in available_descriptors[dimension].values())):
             try:
                 mol3d = prepare_3d_molecule(mol)
                 if mol3d:
                     # PMI and shape descriptors
-                    result_dict[f"{prefix}_NPR1"] = rdMolDescriptors.CalcNPR1(mol3d)
-                    result_dict[f"{prefix}_NPR2"] = rdMolDescriptors.CalcNPR2(mol3d)
-                    result_dict[f"{prefix}_PMI1"] = rdMolDescriptors.CalcPMI1(mol3d)
-                    result_dict[f"{prefix}_PMI2"] = rdMolDescriptors.CalcPMI2(mol3d)
-                    result_dict[f"{prefix}_PMI3"] = rdMolDescriptors.CalcPMI3(mol3d)
-                    result_dict[f"{prefix}_RadiusOfGyration"] = rdMolDescriptors.CalcRadiusOfGyration(mol3d)
-                    result_dict[f"{prefix}_InertialShapeFactor"] = rdMolDescriptors.CalcInertialShapeFactor(mol3d)
-                    result_dict[f"{prefix}_Eccentricity"] = rdMolDescriptors.CalcEccentricity(mol3d)
-                    result_dict[f"{prefix}_Asphericity"] = rdMolDescriptors.CalcAsphericity(mol3d)
-                    result_dict[f"{prefix}_SpherocityIndex"] = rdMolDescriptors.CalcSpherocityIndex(mol3d)
+                    if compute_all_3d or any(desc in descriptors_to_compute for desc in available_descriptors["3d"]["shape"]):
+                        result_dict[f"{prefix}_NPR1"] = rdMolDescriptors.CalcNPR1(mol3d)
+                        result_dict[f"{prefix}_NPR2"] = rdMolDescriptors.CalcNPR2(mol3d)
+                        result_dict[f"{prefix}_PMI1"] = rdMolDescriptors.CalcPMI1(mol3d)
+                        result_dict[f"{prefix}_PMI2"] = rdMolDescriptors.CalcPMI2(mol3d)
+                        result_dict[f"{prefix}_PMI3"] = rdMolDescriptors.CalcPMI3(mol3d)
+                        result_dict[f"{prefix}_RadiusOfGyration"] = rdMolDescriptors.CalcRadiusOfGyration(mol3d)
+                        result_dict[f"{prefix}_InertialShapeFactor"] = rdMolDescriptors.CalcInertialShapeFactor(mol3d)
+                        result_dict[f"{prefix}_Eccentricity"] = rdMolDescriptors.CalcEccentricity(mol3d)
+                        result_dict[f"{prefix}_Asphericity"] = rdMolDescriptors.CalcAsphericity(mol3d)
+                        result_dict[f"{prefix}_SpherocityIndex"] = rdMolDescriptors.CalcSpherocityIndex(mol3d)
                     
                     # 3D AUTOCORR
-                    autocorr3d = rdMolDescriptors.CalcAUTOCORR3D(mol3d)
-                    for i, value in enumerate(autocorr3d):
-                        result_dict[f"{prefix}_AUTOCORR3D_{i+1}"] = value
+                    if compute_all_3d or "AUTOCORR3D" in descriptors_to_compute:
+                        autocorr3d = rdMolDescriptors.CalcAUTOCORR3D(mol3d)
+                        for i, value in enumerate(autocorr3d):
+                            result_dict[f"{prefix}_AUTOCORR3D_{i+1}"] = value
                     
                     # RDF descriptors
-                    rdf = rdMolDescriptors.CalcRDF(mol3d)
-                    for i, value in enumerate(rdf):
-                        result_dict[f"{prefix}_RDF_{i+1}"] = value
+                    if compute_all_3d or "RDF" in descriptors_to_compute:
+                        rdf = rdMolDescriptors.CalcRDF(mol3d)
+                        for i, value in enumerate(rdf):
+                            result_dict[f"{prefix}_RDF_{i+1}"] = value
                     
                     # MORSE descriptors
-                    morse = rdMolDescriptors.CalcMORSE(mol3d)
-                    for i, value in enumerate(morse):
-                        result_dict[f"{prefix}_MORSE_{i+1}"] = value
+                    if compute_all_3d or "MORSE" in descriptors_to_compute:
+                        morse = rdMolDescriptors.CalcMORSE(mol3d)
+                        for i, value in enumerate(morse):
+                            result_dict[f"{prefix}_MORSE_{i+1}"] = value
                     
                     # WHIM descriptors
-                    whim = rdMolDescriptors.CalcWHIM(mol3d)
-                    for i, value in enumerate(whim):
-                        result_dict[f"{prefix}_WHIM_{i+1}"] = value
+                    if compute_all_3d or "WHIM" in descriptors_to_compute:
+                        whim = rdMolDescriptors.CalcWHIM(mol3d)
+                        for i, value in enumerate(whim):
+                            result_dict[f"{prefix}_WHIM_{i+1}"] = value
                     
                     # GETAWAY descriptors
-                    getaway = rdMolDescriptors.CalcGETAWAY(mol3d)
-                    for i, value in enumerate(getaway):
-                        result_dict[f"{prefix}_GETAWAY_{i+1}"] = value
+                    if compute_all_3d or "GETAWAY" in descriptors_to_compute:
+                        getaway = rdMolDescriptors.CalcGETAWAY(mol3d)
+                        for i, value in enumerate(getaway):
+                            result_dict[f"{prefix}_GETAWAY_{i+1}"] = value
                     
                     # Volume and surface area
-                    vol = rdMolDescriptors.CalcCoulombMat(mol3d)
-                    if len(vol) > 0:
-                        result_dict[f"{prefix}_CoulombMatSize"] = len(vol)
-                        result_dict[f"{prefix}_CoulombMatMax"] = np.max(vol)
-                        result_dict[f"{prefix}_CoulombMatMin"] = np.min(vol)
-                        result_dict[f"{prefix}_CoulombMatMean"] = np.mean(vol)
+                    if compute_all_3d or any(desc in descriptors_to_compute for desc in available_descriptors["3d"]["coulomb"]):
+                        vol = rdMolDescriptors.CalcCoulombMat(mol3d)
+                        if len(vol) > 0:
+                            result_dict[f"{prefix}_CoulombMatSize"] = len(vol)
+                            result_dict[f"{prefix}_CoulombMatMax"] = np.max(vol)
+                            result_dict[f"{prefix}_CoulombMatMin"] = np.min(vol)
+                            result_dict[f"{prefix}_CoulombMatMean"] = np.mean(vol)
                     
                     # EEM charges
-                    try:
-                        eem_charges = rdMolDescriptors.CalcEEMcharges(mol3d)
-                        if eem_charges:
-                            result_dict[f"{prefix}_EEM_Min"] = min(eem_charges)
-                            result_dict[f"{prefix}_EEM_Max"] = max(eem_charges)
-                            result_dict[f"{prefix}_EEM_Mean"] = sum(eem_charges) / len(eem_charges)
-                            result_dict[f"{prefix}_EEM_Std"] = np.std(eem_charges)
-                    except:
-                        pass
+                    if compute_all_3d or any(desc in descriptors_to_compute for desc in available_descriptors["3d"]["charges3d"]):
+                        try:
+                            eem_charges = rdMolDescriptors.CalcEEMcharges(mol3d)
+                            if eem_charges:
+                                result_dict[f"{prefix}_EEM_Min"] = min(eem_charges)
+                                result_dict[f"{prefix}_EEM_Max"] = max(eem_charges)
+                                result_dict[f"{prefix}_EEM_Mean"] = sum(eem_charges) / len(eem_charges)
+                                result_dict[f"{prefix}_EEM_Std"] = np.std(eem_charges)
+                        except:
+                            pass
                     
                     # Volume with AllChem
-                    try:
-                        result_dict[f"{prefix}_MolVolume"] = AllChem.ComputeMolVolume(mol3d)
-                    except:
-                        pass
+                    if compute_all_3d or "MolVolume" in descriptors_to_compute:
+                        try:
+                            result_dict[f"{prefix}_MolVolume"] = AllChem.ComputeMolVolume(mol3d)
+                        except:
+                            pass
                     
                     # USR descriptors
-                    try:
-                        usr = rdMolDescriptors.GetUSR(mol3d)
-                        for i, value in enumerate(usr):
-                            result_dict[f"{prefix}_USR_{i+1}"] = value
-                        
-                        usrcat = rdMolDescriptors.GetUSRCAT(mol3d)
-                        for i, value in enumerate(usrcat):
-                            result_dict[f"{prefix}_USRCAT_{i+1}"] = value
-                    except:
-                        pass
+                    if compute_all_3d or "USR" in descriptors_to_compute:
+                        try:
+                            usr = rdMolDescriptors.GetUSR(mol3d)
+                            for i, value in enumerate(usr):
+                                result_dict[f"{prefix}_USR_{i+1}"] = value
+                        except:
+                            pass
+                            
+                    if compute_all_3d or "USRCAT" in descriptors_to_compute:
+                        try:
+                            usrcat = rdMolDescriptors.GetUSRCAT(mol3d)
+                            for i, value in enumerate(usrcat):
+                                result_dict[f"{prefix}_USRCAT_{i+1}"] = value
+                        except:
+                            pass
                     
                     # Oxidation numbers
-                    try:
-                        ox_nums = rdMolDescriptors.CalcOxidationNumbers(mol3d)
-                        if ox_nums:
-                            result_dict[f"{prefix}_OxidationNum_Min"] = min(ox_nums)
-                            result_dict[f"{prefix}_OxidationNum_Max"] = max(ox_nums)
-                            result_dict[f"{prefix}_OxidationNum_Mean"] = sum(ox_nums) / len(ox_nums)
-                            result_dict[f"{prefix}_OxidationNum_Std"] = np.std(ox_nums)
-                    except:
-                        pass
+                    if compute_all_3d or any(desc in descriptors_to_compute for desc in available_descriptors["3d"]["oxidation"]):
+                        try:
+                            ox_nums = rdMolDescriptors.CalcOxidationNumbers(mol3d)
+                            if ox_nums:
+                                result_dict[f"{prefix}_OxidationNum_Min"] = min(ox_nums)
+                                result_dict[f"{prefix}_OxidationNum_Max"] = max(ox_nums)
+                                result_dict[f"{prefix}_OxidationNum_Mean"] = sum(ox_nums) / len(ox_nums)
+                                result_dict[f"{prefix}_OxidationNum_Std"] = np.std(ox_nums)
+                        except:
+                            pass
                     
                     # Surface properties
-                    try:
-                        from rdkit.Chem.rdFreeSASA import CalcSASA
-                        result_dict[f"{prefix}_SurfaceArea"] = CalcSASA(mol3d)
-                    except:
-                        pass
+                    if compute_all_3d or "SurfaceArea" in descriptors_to_compute:
+                        try:
+                            from rdkit.Chem.rdFreeSASA import CalcSASA
+                            result_dict[f"{prefix}_SurfaceArea"] = CalcSASA(mol3d)
+                        except:
+                            pass
             except:
                 pass
 
@@ -529,10 +693,16 @@ def main():
     parser.add_argument('--n-jobs', '-j', type=int, default=None, help='Number of parallel jobs')
     parser.add_argument('--ram-offloading', action='store_true', help='Enable RAM offloading to disk when needed')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    parser.add_argument('--list-descriptors', action='store_true', help='List all available descriptors and exit')
+    parser.add_argument('--compute', default=None, help='Which descriptors to compute (2d, 3d, all, or comma-separated list)')
     
     args = parser.parse_args()
     
     print_message("RDKit Descriptor Calculator")
+    
+    if args.list_descriptors:
+        print_available_descriptors()
+        return 0
     
     if args.ram_offloading:
         print_message("RAM offloading enabled")
@@ -587,10 +757,12 @@ def main():
     
     print_message(f"Computing RDKit descriptors for {len(df)} molecules")
     print_message(f"3D descriptors: {'enabled' if compute_3d else 'disabled'}")
+    if args.compute:
+        print_message(f"Computing descriptors: {args.compute}")
     print_message(f"Using {n_jobs} parallel processes")
     
     smiles_list = df[smiles_col].tolist()
-    mol_data = [(smiles, compute_3d, args.prefix, i) for i, smiles in enumerate(smiles_list)]
+    mol_data = [(smiles, compute_3d, args.prefix, i, args.compute) for i, smiles in enumerate(smiles_list)]
     
     descriptor_columns = {}
     memory_check_interval = max(1, min(100, len(smiles_list) // 20))

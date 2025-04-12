@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error, cohen_kappa_score
 import matplotlib.pyplot as plt
 from rdkit import Chem
-from rdkit.Chem import rdMolDescriptors, rdFingerprintGenerator, Descriptors, Crippen, Lipinski
+from rdkit.Chem import rdMolDescriptors, rdFingerprintGenerator, Descriptors, Crippen, Lipinski, AllChem
 from tqdm import tqdm
 import argparse
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -25,6 +25,15 @@ import multiprocessing
 from functools import partial
 import re
 import gc
+import warnings
+
+# Suppress specific RDKit deprecation warnings
+warnings.filterwarnings("ignore", message="please use MorganGenerator")
+# Suppress RingInfo errors from RDKit
+warnings.filterwarnings("ignore", message="RingInfo not initialized")
+# Suppress other common RDKit warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module='rdkit')
+warnings.filterwarnings("ignore", message="Molecule and fingerprint parameters were provided")
 
 SEED = 42
 np.random.seed(SEED)
@@ -57,6 +66,10 @@ def compute_rdkit_descriptors(mol):
     if mol is None:
         return [0] * 10
     
+    # Ensure ring info is initialized to prevent RingInfo errors
+    if not mol.GetRingInfo().IsInitialized():
+        mol.GetRingInfo().Initialize()
+    
     descriptors = []
     descriptors.append(Descriptors.MolWt(mol))
     descriptors.append(Descriptors.MolLogP(mol))
@@ -64,10 +77,24 @@ def compute_rdkit_descriptors(mol):
     descriptors.append(Descriptors.NumHDonors(mol))
     descriptors.append(Descriptors.NumHAcceptors(mol))
     descriptors.append(Descriptors.TPSA(mol))
-    descriptors.append(Lipinski.NumRotatableBonds(mol))
-    descriptors.append(Descriptors.FractionCSP3(mol))
-    descriptors.append(Descriptors.NumAromaticRings(mol))
-    descriptors.append(Descriptors.NumAliphaticRings(mol))
+    
+    # These descriptors use ring information, make sure it's available
+    try:
+        descriptors.append(Lipinski.NumRotatableBonds(mol))
+        descriptors.append(Descriptors.FractionCSP3(mol))
+        descriptors.append(Descriptors.NumAromaticRings(mol))
+        descriptors.append(Descriptors.NumAliphaticRings(mol))
+    except RuntimeError as e:
+        if "RingInfo not initialized" in str(e):
+            # Try again with explicit initialization
+            mol.GetRingInfo().Initialize()
+            descriptors.append(Lipinski.NumRotatableBonds(mol))
+            descriptors.append(Descriptors.FractionCSP3(mol))
+            descriptors.append(Descriptors.NumAromaticRings(mol))
+            descriptors.append(Descriptors.NumAliphaticRings(mol))
+        else:
+            # If it's some other error, use zeros
+            descriptors.extend([0, 0, 0, 0])
     
     return descriptors
 
@@ -77,12 +104,45 @@ def _process_morgan_chunk(chunk_data, radius, nBits):
     fpgen = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nBits)
     
     for smiles in smiles_chunk:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            fp = fpgen.GetFingerprint(mol)
-            fps.append(np.array(fp))
-        else:
-            fps.append(np.zeros(nBits))
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                # Try sanitizing with SANITIZE_ADJUSTHS flag to fix some kekulization issues
+                Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+                # Ensure ring info is initialized
+                if not mol.GetRingInfo().IsInitialized():
+                    mol.GetRingInfo().Initialize()
+                fp = fpgen.GetFingerprint(mol)
+                fps.append(np.array(fp))
+            else:
+                fps.append(np.zeros(nBits))
+        except Exception as e:
+            # Handle kekulization and other errors
+            if "Can't kekulize mol" in str(e):
+                # For kekulization errors, try with more aggressive sanitization
+                try:
+                    mol = Chem.MolFromSmiles(smiles, sanitize=False)
+                    if mol is not None:
+                        # Try a more lenient sanitization approach
+                        Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_FINDRADICALS|
+                                        Chem.SanitizeFlags.SANITIZE_KEKULIZE|
+                                        Chem.SanitizeFlags.SANITIZE_SETAROMATICITY|
+                                        Chem.SanitizeFlags.SANITIZE_SETCONJUGATION|
+                                        Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION|
+                                        Chem.SanitizeFlags.SANITIZE_CLEANUPCHIRALITY,
+                                        catchErrors=True)
+                        # Explicitly initialize ring info for sanitize=False molecules
+                        mol.GetRingInfo().Initialize()
+                        fp = fpgen.GetFingerprint(mol)
+                        fps.append(np.array(fp))
+                    else:
+                        fps.append(np.zeros(nBits))
+                except:
+                    # If all else fails, just use zeros
+                    fps.append(np.zeros(nBits))
+            else:
+                # For other errors, use zeros
+                fps.append(np.zeros(nBits))
     
     return (chunk_idx, fps)
 
@@ -91,11 +151,19 @@ def _process_maccs_chunk(chunk_data):
     fps = []
     
     for smiles in smiles_chunk:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            fp = rdMolDescriptors.GetMACCSKeysFingerprint(mol)
-            fps.append(np.array(fp))
-        else:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+                # Ensure ring info is initialized
+                if not mol.GetRingInfo().IsInitialized():
+                    mol.GetRingInfo().Initialize()
+                fp = rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+                fps.append(np.array(fp))
+            else:
+                fps.append(np.zeros(167))
+        except:
+            # Handle errors
             fps.append(np.zeros(167))
     
     return (chunk_idx, fps)
@@ -105,11 +173,19 @@ def _process_rdkit_chunk(chunk_data, nBits):
     fps = []
     
     for smiles in smiles_chunk:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            fp = rdMolDescriptors.RDKFingerprint(mol, fpSize=nBits)
-            fps.append(np.array(fp))
-        else:
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+                # Ensure ring info is initialized
+                if not mol.GetRingInfo().IsInitialized():
+                    mol.GetRingInfo().Initialize()
+                fp = rdMolDescriptors.RDKFingerprint(mol, fpSize=nBits)
+                fps.append(np.array(fp))
+            else:
+                fps.append(np.zeros(nBits))
+        except Exception as e:
+            # Handle errors similarly to morgan fingerprints
             fps.append(np.zeros(nBits))
     
     return (chunk_idx, fps)
@@ -119,40 +195,94 @@ def _process_descriptors_chunk(chunk_data):
     fps = []
     
     for smiles in smiles_chunk:
-        mol = Chem.MolFromSmiles(smiles)
-        fps.append(compute_rdkit_descriptors(mol))
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            # Ensure ring info is initialized
+            if mol is not None and not mol.GetRingInfo().IsInitialized():
+                mol.GetRingInfo().Initialize()
+            fps.append(compute_rdkit_descriptors(mol))
+        except:
+            # Handle errors
+            fps.append([0] * 10)
     
     return (chunk_idx, fps)
 
-def _process_atompair_chunk(chunk_data):
+def _process_atompair_chunk(chunk_data, nBits=2048, radius=2):
     smiles_chunk, chunk_idx = chunk_data
     fps = []
-    fpgen = rdFingerprintGenerator.GetAtomPairGenerator()
+    fpgen = rdFingerprintGenerator.GetAtomPairGenerator(fpSize=nBits, maxDistance=radius)
+    
     for smiles in smiles_chunk:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            fp = fpgen.GetSparseFingerprint(mol)
-            fp_counts = fpgen.GetCountFingerprint(mol).ToList()
-            fp_hashed = fpgen.GetHashedFingerprint(mol, nBits=2048)
-            fps.append(np.array(fp_hashed))
-        else:
-            fps.append(np.zeros(2048))
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+                # Ensure ring info is initialized
+                if not mol.GetRingInfo().IsInitialized():
+                    mol.GetRingInfo().Initialize()
+                fp_hashed = fpgen.GetHashedFingerprint(mol)
+                fps.append(np.array(fp_hashed))
+            else:
+                fps.append(np.zeros(nBits))
+        except:
+            # Handle errors
+            fps.append(np.zeros(nBits))
+    
     return (chunk_idx, fps)
 
-def _process_torsion_chunk(chunk_data):
+def _process_torsion_chunk(chunk_data, nBits=2048, radius=3):
     smiles_chunk, chunk_idx = chunk_data
     fps = []
-    fpgen = rdFingerprintGenerator.GetTopologicalTorsionGenerator()
+    fpgen = rdFingerprintGenerator.GetTopologicalTorsionGenerator(fpSize=nBits, includeChirality=(radius > 3))
+    
     for smiles in smiles_chunk:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            fp_hashed = fpgen.GetHashedFingerprint(mol, nBits=2048)
-            fps.append(np.array(fp_hashed))
-        else:
-            fps.append(np.zeros(2048))
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is not None:
+                Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ADJUSTHS)
+                # Ensure ring info is initialized
+                if not mol.GetRingInfo().IsInitialized():
+                    mol.GetRingInfo().Initialize()
+                fp_hashed = fpgen.GetHashedFingerprint(mol)
+                fps.append(np.array(fp_hashed))
+            else:
+                fps.append(np.zeros(nBits))
+        except:
+            # Handle errors
+            fps.append(np.zeros(nBits))
+    
     return (chunk_idx, fps)
 
 def parse_fp_type(fp_type_str):
+    # Handle maccs special case first since it doesn't use radius or bits parameters
+    if fp_type_str.lower() == 'maccs':
+        return 'maccs', {}
+    
+    # Handle incorrect maccs format (maccs doesn't use radius or bits parameters)
+    if fp_type_str.lower().startswith('maccs_'):
+        print(f"-- Warning: MACCS keys don't use radius or bit parameters. Using standard MACCS (167 bits) instead of '{fp_type_str}'")
+        return 'maccs', {}
+    
+    # Handle descriptors special case (doesn't use parameters)
+    if fp_type_str.lower() == 'descriptors':
+        return 'descriptors', {}
+
+    # Handle special case for RDKit fingerprints with incorrect radius specification
+    match = re.match(r"rdkit_(\d+)_(\d+)", fp_type_str, re.IGNORECASE)
+    if match:
+        # RDKit fingerprints don't use radius parameter meaningfully
+        print(f"-- Warning: RDKit fingerprints don't use radius parameter. Using nBits={match.group(2)} instead.")
+        return 'rdkit', {'nBits': int(match.group(2))}
+    
+    # Standardized format: type_radius_nbits
+    match = re.match(r"(morgan|atompair|torsion)_(\d+)_(\d+)", fp_type_str, re.IGNORECASE)
+    if match:
+        fp_type = match.group(1).lower()
+        radius = int(match.group(2))
+        nBits = int(match.group(3))
+        return fp_type, {'radius': radius, 'nBits': nBits}
+    
+    # Legacy formats for backward compatibility
     match = re.match(r"morgan_(\d+)_(\d+)", fp_type_str, re.IGNORECASE)
     if match:
         return 'morgan', {'radius': int(match.group(1)), 'nBits': int(match.group(2))}
@@ -161,14 +291,19 @@ def parse_fp_type(fp_type_str):
     if match:
         return 'rdkit', {'nBits': int(match.group(1))}
         
+    match = re.match(r"atompair_(\d+)", fp_type_str, re.IGNORECASE)
+    if match:
+        return 'atompair', {'nBits': int(match.group(1))}
+        
+    match = re.match(r"torsion_(\d+)", fp_type_str, re.IGNORECASE)
+    if match:
+        return 'torsion', {'nBits': int(match.group(1))}
+        
+    # Default values for simple type specifications
     if fp_type_str.lower() == 'morgan':
         return 'morgan', {'radius': 3, 'nBits': 2048}
     if fp_type_str.lower() == 'rdkit':
         return 'rdkit', {'nBits': 2048}
-    if fp_type_str.lower() == 'maccs':
-        return 'maccs', {}
-    if fp_type_str.lower() == 'descriptors':
-        return 'descriptors', {}
     if fp_type_str.lower() == 'atompair':
         return 'atompair', {'nBits': 2048}
     if fp_type_str.lower() == 'torsion':
@@ -177,7 +312,7 @@ def parse_fp_type(fp_type_str):
     print(f"-- Warning: Unrecognized fingerprint format '{fp_type_str}'. Skipping.")
     return None, None
 
-def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000):
+def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000, normalize=True):
     """Generate molecular fingerprints with memory-efficient batching"""
     
     if n_jobs is None:
@@ -196,6 +331,18 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
     all_fps = []
     batch_results = []
     
+    # Handle comma-separated fingerprint specifications
+    expanded_fp_types = []
+    for fp_spec in fp_types:
+        if ',' in fp_spec:
+            expanded_fp_types.extend(fp_spec.split(','))
+        else:
+            expanded_fp_types.append(fp_spec)
+    
+    # Set up a single progress bar for all operations
+    total_operations = num_batches * len(expanded_fp_types)
+    progress_bar = tqdm(total=total_operations, desc="Generating fingerprints")
+    
     for batch_idx in range(num_batches):
         start_idx = batch_idx * batch_size_fp
         end_idx = min(start_idx + batch_size_fp, total_smiles)
@@ -204,9 +351,10 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
         batch_fps = []
         
         # Process each fingerprint type for this batch
-        for fp_type_str in fp_types:
+        for fp_type_str in expanded_fp_types:
             fp_name, fp_params = parse_fp_type(fp_type_str)
             if fp_name is None:
+                progress_bar.update(1)
                 continue
             
             # Only add to processed_fp_types on first batch
@@ -217,9 +365,17 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
             chunks = np.array_split(current_batch, min(n_jobs, len(current_batch)))
             chunk_data = [(chunk, i) for i, chunk in enumerate(chunks)]
             
-            desc = f"Batch {batch_idx+1}/{num_batches}: {fp_name}"
+            # Update progress bar description
+            if 'radius' in fp_params and fp_name != 'rdkit':
+                fp_desc = f"{fp_name} (r={fp_params['radius']}, bits={fp_params.get('nBits', 'n/a')})"
+            else:
+                fp_desc = f"{fp_name}"
+                if 'nBits' in fp_params:
+                    fp_desc += f" (bits={fp_params['nBits']})"
+            
+            progress_bar.set_description(f"Batch {batch_idx+1}/{num_batches}: {fp_desc}")
+            
             if fp_name == 'morgan':
-                desc += f" (r={fp_params['radius']})"
                 process_func = partial(_process_morgan_chunk, radius=fp_params['radius'], nBits=fp_params['nBits'])
             elif fp_name == 'rdkit':
                 process_func = partial(_process_rdkit_chunk, nBits=fp_params['nBits'])
@@ -228,20 +384,21 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
             elif fp_name == 'descriptors':
                 process_func = _process_descriptors_chunk
             elif fp_name == 'atompair':
-                process_func = _process_atompair_chunk
+                nBits = fp_params.get('nBits', 2048)
+                radius = fp_params.get('radius', 2)  # Use radius as maxDistance for atom pairs
+                process_func = partial(_process_atompair_chunk, nBits=nBits, radius=radius)
             elif fp_name == 'torsion':
-                process_func = _process_torsion_chunk
+                nBits = fp_params.get('nBits', 2048)
+                radius = fp_params.get('radius', 3)  # Use radius for torsion path length/complexity
+                process_func = partial(_process_torsion_chunk, nBits=nBits, radius=radius)
             else:
                 print(f"-- Warning: Unknown fingerprint type '{fp_name}'")
+                progress_bar.update(1)
                 continue
             
-            # Process chunks in parallel
+            # Process chunks in parallel without individual progress bars
             with multiprocessing.Pool(n_jobs) as pool:
-                results = list(tqdm(
-                    pool.imap(process_func, chunk_data),
-                    total=len(chunk_data),
-                    desc=desc
-                ))
+                results = list(pool.imap(process_func, chunk_data))
             
             # Combine results from parallel processing
             results.sort(key=lambda x: x[0])
@@ -250,6 +407,7 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
                 fp_list.extend(chunk_fps)
             
             batch_fps.append(np.array(fp_list))
+            progress_bar.update(1)
         
         # If we have fingerprints for this batch, combine them
         if batch_fps:
@@ -260,10 +418,24 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
         # Explicitly clean up to reduce memory usage
         gc.collect()
     
+    progress_bar.close()
+    
     # Combine all batches
     if batch_results:
         # Vertical stack of all batches
         final_features = np.vstack(batch_results)
+        
+        # Normalize if requested - important for neural network performance
+        if normalize:
+            # Apply simple scaling (binary fingerprints are typically 0/1)
+            # Use feature-wise min-max scaling for fingerprints
+            feature_max = np.max(final_features, axis=0)
+            # Avoid division by zero for features with all 0s
+            feature_max[feature_max == 0] = 1.0
+            final_features = final_features / feature_max
+            
+            print(f"-- Features normalized to [0-1] range")
+        
         print(f"-- Generated features shape: {final_features.shape}")
         return final_features, processed_fp_types
     else:
@@ -272,7 +444,8 @@ def generate_fingerprints(smiles_list, fp_types, n_jobs=None, batch_size_fp=5000
 
 def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size=0.1, val_size=0.1,
                     fingerprint_types=None, use_input_descriptors=False, external_test_file=None, n_jobs=None, 
-                    batch_size_fp=5000, use_infile_fp=False, fp_prefixes=None):
+                    batch_size_fp=5000, use_infile_fp=False, fp_prefixes=None, normalize_fingerprints=True,
+                    descriptor_cols=None, no_feature_alignment=False):
     print(f"-- Loading data from {data_path}")
     df = pd.read_csv(data_path)
     
@@ -305,39 +478,59 @@ def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size
             else:
                 print(f"-- Warning: No columns found with prefix '{prefix}'")
         
+        # Also search for columns with '_fp_' pattern if explicit prefixes didn't find enough columns
+        if not fp_columns and 'fp_pattern' not in fp_prefixes:
+            fp_pattern_cols = [col for col in df.columns if '_fp_' in col]
+            if fp_pattern_cols:
+                print(f"-- Found {len(fp_pattern_cols)} fingerprint columns using '_fp_' pattern detection")
+                fp_columns.extend(fp_pattern_cols)
+                
+                # Add a generic fp prefix to process metadata
+                fp_prefixes.append('fp_pattern')
+        
         if fp_columns:
             fingerprints = df[fp_columns].values
             print(f"-- Using {len(fp_columns)} fingerprint columns from input file")
             
             # Create metadata about fingerprint configuration
             for prefix in fp_prefixes:
-                prefix_cols = [col for col in df.columns if col.startswith(prefix)]
-                if prefix_cols:
-                    # Try to determine fingerprint type from prefix
-                    if 'morgan' in prefix.lower():
-                        fp_type = 'morgan'
-                        fp_params = {'radius': 3, 'nBits': len(prefix_cols)}
-                    elif 'maccs' in prefix.lower():
-                        fp_type = 'maccs'
-                        fp_params = {}
-                    elif 'rdkit' in prefix.lower():
-                        fp_type = 'rdkit'
-                        fp_params = {'nBits': len(prefix_cols)}
-                    elif 'atompair' in prefix.lower():
-                        fp_type = 'atompair'
-                        fp_params = {'nBits': len(prefix_cols)}
-                    elif 'torsion' in prefix.lower():
-                        fp_type = 'torsion'
-                        fp_params = {'nBits': len(prefix_cols)}
-                    else:
-                        fp_type = 'custom'
-                        fp_params = {'nBits': len(prefix_cols)}
-                    
-                    processed_fp_config.append({'name': fp_type, 'prefix': prefix, **fp_params})
+                if prefix == 'fp_pattern':
+                    # Handle pattern-detected fingerprints
+                    pattern_cols = [col for col in df.columns if '_fp_' in col]
+                    if pattern_cols:
+                        fp_type = 'detected'
+                        fp_params = {'nBits': len(pattern_cols)}
+                        processed_fp_config.append({'name': fp_type, 'prefix': 'fp_pattern', **fp_params})
+                else:
+                    prefix_cols = [col for col in df.columns if col.startswith(prefix)]
+                    if prefix_cols:
+                        # Try to determine fingerprint type from prefix
+                        if 'morgan' in prefix.lower():
+                            fp_type = 'morgan'
+                            fp_params = {'radius': 3, 'nBits': len(prefix_cols)}
+                        elif 'maccs' in prefix.lower():
+                            fp_type = 'maccs'
+                            fp_params = {}
+                        elif 'rdkit' in prefix.lower():
+                            fp_type = 'rdkit'
+                            fp_params = {'nBits': len(prefix_cols)}
+                        elif 'atompair' in prefix.lower():
+                            fp_type = 'atompair'
+                            fp_params = {'nBits': len(prefix_cols)}
+                        elif 'torsion' in prefix.lower():
+                            fp_type = 'torsion'
+                            fp_params = {'nBits': len(prefix_cols)}
+                        else:
+                            fp_type = 'custom'
+                            fp_params = {'nBits': len(prefix_cols)}
+                        
+                        processed_fp_config.append({'name': fp_type, 'prefix': prefix, **fp_params})
     # Generate fingerprints on the fly if not using pre-computed ones
     elif fingerprint_types is not None:
         print(f"-- Generating molecular fingerprints: {fingerprint_types}")
-        fingerprints, processed_fp_config = generate_fingerprints(df[smiles_col].values, fingerprint_types, n_jobs=n_jobs, batch_size_fp=batch_size_fp)
+        fingerprints, processed_fp_config = generate_fingerprints(df[smiles_col].values, fingerprint_types, 
+                                                                 n_jobs=n_jobs, batch_size_fp=batch_size_fp,
+                                                                 normalize=normalize_fingerprints)
     else:
         print("-- No fingerprint types specified and not using pre-computed fingerprints")
     
@@ -357,9 +550,16 @@ def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size
             for prefix in fp_prefixes:
                 excluded_cols.extend([col for col in df.columns if col.startswith(prefix)])
         
-        descriptor_cols = [col for col in df.columns if col not in excluded_cols]
+        # Look for columns that match the provided descriptor columns or contain "_desc_" in their name
+        auto_detect_desc = descriptor_cols and '_desc_pattern' in descriptor_cols
+        if auto_detect_desc:
+            descriptor_cols = [col for col in df.columns if col not in excluded_cols and ('_desc_' in col or col in descriptor_cols)]
+            print(f"-- Auto-detecting descriptor columns with '_desc_' pattern")
+        else:
+            descriptor_cols = [col for col in df.columns if col not in excluded_cols]
+            
         if descriptor_cols:
-            print(f"-- Using {len(descriptor_cols)} input descriptors from dataset: {descriptor_cols}")
+            print(f"-- Using {len(descriptor_cols)} input descriptors from dataset")
             descriptors = df[descriptor_cols].values.astype(float)
             
             if np.isnan(descriptors).any():
@@ -409,6 +609,13 @@ def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size
                 else:
                     print(f"-- Warning: No columns with prefix '{prefix}' found in test set")
             
+            # Also search for columns with '_fp_' pattern if explicit prefixes didn't find enough columns
+            if not fp_columns and 'fp_pattern' in fp_prefixes:
+                fp_pattern_cols = [col for col in test_df.columns if '_fp_' in col]
+                if fp_pattern_cols:
+                    print(f"-- Found {len(fp_pattern_cols)} fingerprint columns using '_fp_' pattern detection in test set")
+                    fp_columns.extend(fp_pattern_cols)
+            
             if fp_columns:
                 test_fingerprints = test_df[fp_columns].values
                 print(f"-- Using {len(fp_columns)} fingerprint columns from test file")
@@ -416,7 +623,9 @@ def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size
                 print(f"-- Warning: No matching fingerprint columns found in test file")
         else:
             # Generate fingerprints for test set
-            test_fingerprints, _ = generate_fingerprints(test_df[test_smiles_col].values, fingerprint_types, n_jobs=n_jobs, batch_size_fp=batch_size_fp)
+            test_fingerprints, _ = generate_fingerprints(test_df[test_smiles_col].values, fingerprint_types, 
+                                                       n_jobs=n_jobs, batch_size_fp=batch_size_fp,
+                                                       normalize=normalize_fingerprints)
         
         test_feature_list = []
         if test_fingerprints.size > 0:
@@ -460,8 +669,43 @@ def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size
         test_features = np.hstack(test_feature_list)
         print(f"-- Final combined test features shape: {test_features.shape}")
         
+        # Check for feature dimension mismatch and handle it using the alignment function
         if test_features.shape[1] != all_features.shape[1]:
-             raise ValueError(f"Feature dimension mismatch between training ({all_features.shape[1]}) and test ({test_features.shape[1]}) sets.")
+            print(f"-- Feature dimension mismatch between training ({all_features.shape[1]}) and test ({test_features.shape[1]}) sets")
+            
+            if no_feature_alignment:
+                print("-- Feature alignment disabled. Raising error for dimension mismatch.")
+                raise ValueError(f"Feature dimension mismatch between training ({all_features.shape[1]}) and test ({test_features.shape[1]}) sets")
+            
+            # Create feature names dictionary if using descriptors or fingerprints with traceable column names
+            feature_names = None
+            feature_mapping = None
+            
+            if use_infile_fp and fp_prefixes:
+                # Try to gather column names for alignment
+                train_fp_cols = []
+                test_fp_cols = []
+                
+                for prefix in fp_prefixes:
+                    train_fp_cols.extend([col for col in df.columns if col.startswith(prefix)])
+                    test_fp_cols.extend([col for col in test_df.columns if col.startswith(prefix)])
+                
+                if train_fp_cols and test_fp_cols:
+                    # If using fingerprints, and we have column names, prepare feature names dict
+                    feature_names = {
+                        'train': train_fp_cols,
+                        'test': test_fp_cols
+                    }
+            
+            # Align test features with training features
+            test_features, alignment_info = align_feature_sets(
+                all_features, test_features, 
+                feature_names=feature_names,
+                feature_mapping=feature_mapping
+            )
+            
+            print(f"-- Feature alignment status: {alignment_info['status']}")
+            print(f"-- Adjusted test features shape: {test_features.shape}")
 
         test_targets = test_df[target_col].values if has_targets else np.zeros(len(test_df))
         test_smiles = test_df[test_smiles_col].values
@@ -508,6 +752,7 @@ def preprocess_data(data_path, target_col='LOGD', smiles_col='SMILES', test_size
         'scaler_state': scaler.get_params() if scaler else None,
         'scaler_mean': scaler.mean_.tolist() if scaler else None,
         'scaler_scale': scaler.scale_.tolist() if scaler else None,
+        'normalize_fingerprints': normalize_fingerprints
     }
     
     return train_dataset, val_dataset, test_dataset, model_metadata
@@ -964,7 +1209,7 @@ def create_model_and_train(trial, train_dataset, val_dataset, input_dim, output_
 
 def predict_with_model(model, data_path, output_file, smiles_col, target_col=None, model_metadata=None, n_jobs=None,
                         plot_dpi=150, plot_format='png', batch_size=128, batch_size_fp=5000, 
-                        use_infile_fp=False, fp_prefixes=None):
+                        use_infile_fp=False, fp_prefixes=None, normalize_fingerprints=True, no_feature_alignment=False):
     df = pd.read_csv(data_path)
     
     if smiles_col not in df.columns:
@@ -995,6 +1240,13 @@ def predict_with_model(model, data_path, output_file, smiles_col, target_col=Non
     use_input_descriptors = model_metadata.get('use_input_descriptors', False)
     descriptor_cols = model_metadata.get('descriptor_cols', [])
     expected_input_dim = model_metadata.get('input_dim')
+    
+    # Check if model was trained with normalized fingerprints
+    model_normalize_fp = model_metadata.get('normalize_fingerprints', True)
+    if model_normalize_fp != normalize_fingerprints:
+        print(f"-- Warning: Model was trained with normalize_fingerprints={model_normalize_fp}, but prediction is using normalize_fingerprints={normalize_fingerprints}")
+        print(f"-- Using model's normalization setting: {model_normalize_fp}")
+        normalize_fingerprints = model_normalize_fp
 
     # Determine whether to use pre-computed fingerprints or generate them
     fingerprints = np.array([])
@@ -1011,13 +1263,21 @@ def predict_with_model(model, data_path, output_file, smiles_col, target_col=Non
             else:
                 print(f"-- Warning: No columns found with prefix '{prefix}'")
         
+        # Also search for columns with '_fp_' pattern if explicit prefixes didn't find enough columns
+        if not fp_columns and 'fp_pattern' in fp_prefixes:
+            fp_pattern_cols = [col for col in df.columns if '_fp_' in col]
+            if fp_pattern_cols:
+                print(f"-- Found {len(fp_pattern_cols)} fingerprint columns using '_fp_' pattern detection")
+                fp_columns.extend(fp_pattern_cols)
+        
         if fp_columns:
             fingerprints = df[fp_columns].values
             print(f"-- Using {len(fp_columns)} fingerprint columns from input file")
         else:
             print(f"-- Warning: No fingerprint columns found with specified prefixes. Will generate fingerprints.")
             print(f"-- Generating features using model's config: {fp_type_strings}")
-            fingerprints, _ = generate_fingerprints(df[smiles_col].values, fp_type_strings, n_jobs=n_jobs, batch_size_fp=batch_size_fp)
+            fingerprints, _ = generate_fingerprints(df[smiles_col].values, fp_type_strings, n_jobs=n_jobs, 
+                                                  batch_size_fp=batch_size_fp, normalize=normalize_fingerprints)
     # Fall back to model's original settings
     elif use_infile_fp_meta and fp_prefixes_meta:
         print(f"-- Using pre-computed fingerprints based on model metadata with prefixes: {fp_prefixes_meta}")
@@ -1030,17 +1290,26 @@ def predict_with_model(model, data_path, output_file, smiles_col, target_col=Non
             else:
                 print(f"-- Warning: No columns found with prefix '{prefix}'")
         
+        # Also search for columns with '_fp_' pattern if explicit prefixes didn't find enough columns
+        if not fp_columns and 'fp_pattern' in fp_prefixes_meta:
+            fp_pattern_cols = [col for col in df.columns if '_fp_' in col]
+            if fp_pattern_cols:
+                print(f"-- Found {len(fp_pattern_cols)} fingerprint columns using '_fp_' pattern detection")
+                fp_columns.extend(fp_pattern_cols)
+                
         if fp_columns:
             fingerprints = df[fp_columns].values
             print(f"-- Using {len(fp_columns)} fingerprint columns from input file")
         else:
             print(f"-- Warning: No fingerprint columns found with model metadata prefixes. Will generate fingerprints.")
             print(f"-- Generating features using model's config: {fp_type_strings}")
-            fingerprints, _ = generate_fingerprints(df[smiles_col].values, fp_type_strings, n_jobs=n_jobs, batch_size_fp=batch_size_fp)
+            fingerprints, _ = generate_fingerprints(df[smiles_col].values, fp_type_strings, n_jobs=n_jobs, 
+                                                  batch_size_fp=batch_size_fp, normalize=normalize_fingerprints)
     # Generate fingerprints if not using pre-computed ones
     else:
         print(f"-- Generating features using model's config: {fp_type_strings}")
-        fingerprints, _ = generate_fingerprints(df[smiles_col].values, fp_type_strings, n_jobs=n_jobs, batch_size_fp=batch_size_fp)
+        fingerprints, _ = generate_fingerprints(df[smiles_col].values, fp_type_strings, n_jobs=n_jobs, 
+                                              batch_size_fp=batch_size_fp, normalize=normalize_fingerprints)
     
     feature_list = []
     if fingerprints.size > 0:
@@ -1056,11 +1325,20 @@ def predict_with_model(model, data_path, output_file, smiles_col, target_col=Non
             for prefix in fp_prefixes_meta:
                 excluded_cols.extend([col for col in df.columns if col.startswith(prefix)])
         
+        # Check if we should auto-detect descriptor columns
+        auto_detect_desc = descriptor_cols and '_desc_pattern' in descriptor_cols
+        
         # Get descriptor columns that are both in the model metadata and in the input file
-        predict_descriptor_cols = [col for col in df.columns if col in descriptor_cols and col not in excluded_cols]
+        if auto_detect_desc:
+            # Auto-detect columns with "_desc_" in their name
+            predict_descriptor_cols = [col for col in df.columns if ('_desc_' in col or col in descriptor_cols) and col not in excluded_cols]
+            print(f"-- Auto-detecting descriptor columns with '_desc_' pattern")
+        else:
+            predict_descriptor_cols = [col for col in df.columns if col in descriptor_cols and col not in excluded_cols]
+            
         if predict_descriptor_cols:
-            if set(predict_descriptor_cols) != set(descriptor_cols):
-                 print(f"-- Warning: Mismatch in descriptor columns. Expected: {descriptor_cols}, Found: {predict_descriptor_cols}")
+            if not auto_detect_desc and set(predict_descriptor_cols) != set(descriptor_cols):
+                print(f"-- Warning: Mismatch in descriptor columns. Expected: {descriptor_cols}, Found: {predict_descriptor_cols}")
             
             try:
                 descriptors_raw = df[predict_descriptor_cols].values.astype(float)
@@ -1103,9 +1381,56 @@ def predict_with_model(model, data_path, output_file, smiles_col, target_col=Non
     features = np.hstack(feature_list)
     
     if expected_input_dim is not None and features.shape[1] != expected_input_dim:
-        print(f"-- Error: Feature dimension mismatch. Model expects {expected_input_dim}, generated {features.shape[1]}.")
-        print("-- This likely means the input data or fingerprint/descriptor settings differ from training.")
-        raise ValueError("Feature dimension mismatch during prediction.")
+        print(f"-- Feature dimension mismatch. Model expects {expected_input_dim}, generated {features.shape[1]}.")
+        
+        if no_feature_alignment:
+            print("-- Feature alignment disabled. Raising error for dimension mismatch.")
+            raise ValueError(f"Feature dimension mismatch. Model expects {expected_input_dim}, but got {features.shape[1]}.")
+        
+        # Create reference features for alignment
+        reference_features = np.zeros((1, expected_input_dim))
+        
+        # Try to gather column names if available for intelligent alignment
+        feature_names = None
+        if use_infile_fp and fp_prefixes:
+            pred_fp_cols = []
+            for prefix in fp_prefixes:
+                pred_fp_cols.extend([col for col in df.columns if col.startswith(prefix)])
+                
+            # Get fingerprint prefixes from model metadata
+            model_fp_cols = []
+            model_fp_config = model_metadata.get('fingerprint_config', [])
+            for fp_conf in model_fp_config:
+                if 'prefix' in fp_conf:
+                    prefix = fp_conf['prefix']
+                    nbits = fp_conf.get('nBits', 2048)
+                    # Generate expected column names based on prefix and nbits
+                    model_fp_cols.extend([f"{prefix}{i}" for i in range(nbits)])
+            
+            if pred_fp_cols and model_fp_cols:
+                feature_names = {
+                    'train': model_fp_cols,
+                    'test': pred_fp_cols
+                }
+        
+        # Use the alignment function to handle different dimensions
+        features, alignment_info = align_feature_sets(
+            reference_features, features,
+            feature_names=feature_names
+        )
+        
+        print(f"-- Feature alignment status: {alignment_info['status']}")
+        print(f"-- Adjusted features shape: {features.shape}")
+        
+        # If after alignment we still don't have the right dimensions, error out
+        if features.shape[1] != expected_input_dim:
+            print("-- Error: Feature alignment failed to match model input dimensions")
+            print("-- Recommended actions:")
+            print("   1. Check if fingerprint types match those used during training")
+            print("   2. Ensure all required descriptor columns are present")
+            print("   3. Re-run with --auto-detect-fp to find fingerprint columns automatically")
+            print("   4. Try re-training the model with the same feature set as your prediction input")
+            raise ValueError("Feature dimension mismatch during prediction. Feature alignment failed.")
     
     tensor_features = torch.tensor(features, dtype=torch.float32).to(device)
     
@@ -1267,6 +1592,96 @@ def load_model_with_metadata(model_dir):
     
     return model, model_metadata
 
+def align_feature_sets(train_features, test_features, feature_names=None, feature_mapping=None):
+    """
+    Align features between training and test/prediction datasets by matching columns.
+    
+    Args:
+        train_features: Training features matrix (numpy array)
+        test_features: Test/prediction features matrix (numpy array)
+        feature_names: List of feature names corresponding to columns (optional)
+        feature_mapping: Dictionary mapping test feature indices to train feature indices (optional)
+        
+    Returns:
+        (aligned_test_features, feature_alignment_info)
+    """
+    if train_features.shape[1] == test_features.shape[1]:
+        print(f"-- Feature dimensions already match: {train_features.shape[1]}")
+        return test_features, {"status": "exact_match"}
+    
+    print(f"-- Feature dimension mismatch: Training={train_features.shape[1]}, Test={test_features.shape[1]}")
+    
+    # If we have feature names, we can do a more intelligent alignment
+    if feature_names is not None:
+        train_names = feature_names.get('train', [])
+        test_names = feature_names.get('test', [])
+        
+        if len(train_names) == train_features.shape[1] and len(test_names) == test_features.shape[1]:
+            print(f"-- Attempting to align features by name")
+            
+            # Find common features
+            common_features = set(train_names).intersection(set(test_names))
+            print(f"-- Found {len(common_features)} common features")
+            
+            if len(common_features) > 0:
+                # Create a new test feature matrix with aligned features
+                aligned_test = np.zeros((test_features.shape[0], train_features.shape[1]))
+                
+                # For each training feature, find it in test features if it exists
+                matched_count = 0
+                for i, train_feat in enumerate(train_names):
+                    if train_feat in test_names:
+                        test_idx = test_names.index(train_feat)
+                        aligned_test[:, i] = test_features[:, test_idx]
+                        matched_count += 1
+                
+                print(f"-- Successfully matched {matched_count}/{train_features.shape[1]} features")
+                return aligned_test, {
+                    "status": "aligned_by_name",
+                    "matched": matched_count,
+                    "total": train_features.shape[1]
+                }
+    
+    # If we have a feature mapping, use it
+    if feature_mapping is not None:
+        print(f"-- Aligning features using provided mapping")
+        aligned_test = np.zeros((test_features.shape[0], train_features.shape[1]))
+        
+        for train_idx, test_idx in feature_mapping.items():
+            if test_idx < test_features.shape[1]:
+                aligned_test[:, train_idx] = test_features[:, test_idx]
+        
+        return aligned_test, {
+            "status": "aligned_by_mapping",
+            "mapping": feature_mapping
+        }
+    
+    # If test has more features than train, truncate
+    if test_features.shape[1] > train_features.shape[1]:
+        print(f"-- Truncating test features to match training dimensions")
+        return test_features[:, :train_features.shape[1]], {
+            "status": "truncated",
+            "original": test_features.shape[1],
+            "new": train_features.shape[1]
+        }
+    
+    # If test has fewer features than train, pad with zeros
+    if test_features.shape[1] < train_features.shape[1]:
+        print(f"-- Padding test features to match training dimensions")
+        aligned_test = np.zeros((test_features.shape[0], train_features.shape[1]))
+        aligned_test[:, :test_features.shape[1]] = test_features
+        return aligned_test, {
+            "status": "padded",
+            "original": test_features.shape[1],
+            "new": train_features.shape[1]
+        }
+    
+    # Should not reach here, but just in case
+    return test_features, {"status": "unknown"}
+
+def main():
+    parser = argparse.ArgumentParser(description='Neural Network for Molecular Property Prediction')
+    
 def main():
     parser = argparse.ArgumentParser(description='Neural Network for Molecular Property Prediction')
     
@@ -1293,6 +1708,10 @@ def main():
                              help='Column name for SMILES strings')
     train_parser.add_argument('--target-col', type=str, default='LOGD', 
                              help='Column name for target values')
+    train_parser.add_argument('--test-size', type=float, default=0.1, 
+                             help='Fraction of data to use for testing (default: 0.1)')
+    train_parser.add_argument('--val-size', type=float, default=0.1, 
+                             help='Fraction of training data to use for validation (default: 0.1)')
     train_parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     train_parser.add_argument('--patience', type=int, default=15, help='Patience for early stopping')
     train_parser.add_argument('--n-trials', type=int, default=25, help='Number of Optuna trials')
@@ -1304,15 +1723,24 @@ def main():
                              help='Path to external test set CSV file')
     train_parser.add_argument('--use-input-descriptors', action='store_true', 
                              help='Use all other non-target, non-smiles columns as input features (scaled, NaNs imputed with mean)')
+    train_parser.add_argument('--auto-detect-desc', action='store_true',
+                             help='Automatically detect columns with "_desc_" in the name as descriptor columns')
     train_parser.add_argument('--use-infile-fp', action='store_true',
                              help='Use fingerprints already present in the input file instead of generating them')
     train_parser.add_argument('--fp-prefixes', type=str, nargs='+', default=[],
                              help='Column prefixes to identify fingerprint columns in the input file (e.g., morgan_fp_, maccs_)')
+    train_parser.add_argument('--auto-detect-fp', action='store_true',
+                             help='Automatically detect columns with "_fp_" in the name as fingerprint columns')
+    train_parser.add_argument('--auto-detect-desc', action='store_true',
+                             help='Automatically detect columns with "_desc_" in the name as descriptor columns')
+    train_parser.add_argument('--no-feature-alignment', action='store_true',
+                             help='Disable automatic feature alignment between datasets with different dimensions')
     train_parser.add_argument('--fingerprints', type=str, nargs='+', default=['morgan_3_2048'], 
-                             help='Fingerprint types to use. Examples: morgan (default 3_2048), morgan_radius_nbits (e.g., morgan_4_4096), '
-                                  'maccs, rdkit (default 2048), rdkit_nbits (e.g., rdkit_4096), descriptors, '
-                                  'atompair (default hashed 2048), atompair_nbits (e.g., atompair_4096), '
-                                  'torsion (default hashed 2048), torsion_nbits (e.g., torsion_4096)')
+                             help='Fingerprint types to use. Format: type_radius_nbits for all types. Can use comma-separated values. Examples: morgan_3_2048, atompair_2_4096, torsion_4_2048, rdkit_2_4096. ' 
+                                  'Simple forms are also supported: morgan, rdkit, maccs, descriptors, atompair, torsion (with defaults). '
+                                  'Multiple fingerprint types can be specified and will be concatenated.')
+    train_parser.add_argument('--no-normalize-fingerprints', dest='normalize_fingerprints', action='store_false',
+                             help='Disable normalization of fingerprints (not recommended)')
     
     # Architecture parameterization arguments
     train_parser.add_argument('--hidden-dims', type=int, nargs='+', 
@@ -1322,7 +1750,7 @@ def main():
     train_parser.add_argument('--activation', type=str, default='relu', 
                              choices=['relu', 'leaky_relu', 'silu', 'gelu', 'tanh'], 
                              help='Activation function for hidden layers')
-    train_parser.add_argument('--learning-rate', type=float, default=0.0001, 
+    train_parser.add_argument('--learning-rate', type=float, default=0.001, 
                              help='Initial learning rate')
     train_parser.add_argument('--weight-decay', type=float, default=1e-5, 
                              help='Weight decay (L2 regularization)')
@@ -1342,7 +1770,7 @@ def main():
                              help='Standard deviation for data augmentation noise')
     
     train_parser.set_defaults(optimize=True, batch_norm=True, residual_connections=False, 
-                             layer_norm=False, use_augmentation=False)
+                             layer_norm=False, use_augmentation=False, normalize_fingerprints=True)
     
     predict_parser = subparsers.add_parser('predict', help='Make predictions with a trained model', parents=[common_parser])
     predict_parser.add_argument('--model', type=str, required=True, 
@@ -1359,23 +1787,46 @@ def main():
                                help='Use fingerprints already present in the input file instead of generating them')
     predict_parser.add_argument('--fp-prefixes', type=str, nargs='+', default=[],
                                help='Column prefixes to identify fingerprint columns in the input file (e.g., morgan_fp_, maccs_)')
+    predict_parser.add_argument('--auto-detect-fp', action='store_true',
+                               help='Automatically detect columns with "_fp_" in the name as fingerprint columns')
+    predict_parser.add_argument('--auto-detect-desc', action='store_true',
+                               help='Automatically detect columns with "_desc_" in the name as descriptor columns')
+    predict_parser.add_argument('--no-feature-alignment', action='store_true',
+                               help='Disable automatic feature alignment between datasets with different dimensions')
+    predict_parser.add_argument('--no-normalize-fingerprints', dest='normalize_fingerprints', action='store_false',
+                               help='Disable normalization of fingerprints (not recommended)')
+    predict_parser.set_defaults(normalize_fingerprints=True)
     
     args = parser.parse_args()
 
     if args.mode == 'train':
         os.makedirs(args.output, exist_ok=True)
         
+        # If auto-detect-fp is specified, add 'fp_pattern' to the fp_prefixes
+        if args.auto_detect_fp and 'fp_pattern' not in args.fp_prefixes:
+            args.fp_prefixes.append('fp_pattern')
+        
+        # If auto-detect-desc is specified, create descriptor_cols list and add '_desc_pattern'
+        descriptor_cols = []
+        if args.auto_detect_desc:
+            descriptor_cols = ['_desc_pattern']
+        
         train_dataset, val_dataset, test_dataset, model_metadata = preprocess_data(
-            args.input, 
+            args.input,
             target_col=args.target_col,
             smiles_col=args.smiles_col,
+            test_size=args.test_size,
+            val_size=args.val_size,
             fingerprint_types=args.fingerprints,
             use_input_descriptors=args.use_input_descriptors,
             external_test_file=args.external_test_set,
             n_jobs=args.n_jobs,
             batch_size_fp=args.batch_size_fp,
             use_infile_fp=args.use_infile_fp,
-            fp_prefixes=args.fp_prefixes
+            fp_prefixes=args.fp_prefixes,
+            normalize_fingerprints=args.normalize_fingerprints,
+            descriptor_cols=descriptor_cols if descriptor_cols else None,
+            no_feature_alignment=args.no_feature_alignment
         )
         
         input_dim = model_metadata['input_dim']
@@ -1614,6 +2065,19 @@ def main():
             else:
                 output_file = args.output
             
+            # If auto-detect-fp is specified, add 'fp_pattern' to the fp_prefixes
+            if args.auto_detect_fp and 'fp_pattern' not in args.fp_prefixes:
+                args.fp_prefixes.append('fp_pattern')
+                print(f"-- Auto-detecting fingerprint columns with '_fp_' pattern")
+            
+            # If auto-detect-desc is specified, add '_desc_pattern' to descriptor_cols in model_metadata
+            if args.auto_detect_desc:
+                if 'descriptor_cols' not in model_metadata:
+                    model_metadata['descriptor_cols'] = []
+                if '_desc_pattern' not in model_metadata['descriptor_cols']:
+                    model_metadata['descriptor_cols'].append('_desc_pattern')
+                print(f"-- Auto-detecting descriptor columns with '_desc_' pattern")
+            
             predict_with_model(
                 model, args.input, output_file, 
                 args.smiles_col, args.target_col, 
@@ -1624,7 +2088,9 @@ def main():
                 batch_size=args.batch_size,
                 batch_size_fp=args.batch_size_fp,
                 use_infile_fp=args.use_infile_fp,
-                fp_prefixes=args.fp_prefixes
+                fp_prefixes=args.fp_prefixes,
+                normalize_fingerprints=args.normalize_fingerprints,
+                no_feature_alignment=args.no_feature_alignment
             )
             
         except Exception as e:

@@ -685,6 +685,10 @@ def main():
     external_df = None
     if args.external_test_set and os.path.isfile(args.external_test_set):
         external_df = load_data(args.external_test_set)
+        # Check if external dataset might be transposed
+        if external_df.shape[1] > external_df.shape[0]:
+            log_message(f"WARNING: External dataset has more columns ({external_df.shape[1]}) than rows ({external_df.shape[0]})")
+            log_message(f"This might indicate a transposed dataset. Verify data format if results seem incorrect.")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"{args.target.lower()}_{timestamp}" if args.target else f"model_{timestamp}"
     model_dir = os.path.join(args.output_dir, run_id)
@@ -774,6 +778,60 @@ def main():
     feature_path = os.path.join(model_dir, "features.json")
     with open(feature_path, "w") as f:
         json.dump({"features": feature_list, "n_features": len(feature_list)}, f, indent=2)
+    
+    # Split data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, random_state=42)
+    
+    # Define model parameters
+    tree_method, gpu_id = detect_device(args.device, args.gpu)
+    objective = args.objective if args.objective else get_default_objective(args.task)
+    eval_metric = args.metric if args.metric else get_default_metric(args.task, objective)
+    
+    params = {
+        "n_estimators": args.n_estimators,
+        "learning_rate": args.learning_rate,
+        "max_depth": args.max_depth,
+        "subsample": args.subsample,
+        "colsample_bytree": args.colsample_bytree,
+        "gamma": args.gamma,
+        "min_child_weight": args.min_child_weight,
+        "reg_alpha": args.reg_alpha,
+        "reg_lambda": args.reg_lambda,
+        "objective": objective,
+        "tree_method": tree_method,
+        "verbosity": 1 if args.verbose else 0,
+        "random_state": 42
+    }
+    
+    if gpu_id is not None:
+        params["gpu_id"] = gpu_id
+    
+    if args.early_stopping > 0:
+        params["early_stopping_rounds"] = args.early_stopping
+    
+    if args.tune_optuna:
+        log_message("Optimizing hyperparameters with Optuna")
+        try:
+            tuned_params, optuna_study, optuna_trials = optimize_xgboost_optuna(
+                X_train, y_train, params, args, args.task
+            )
+            params = tuned_params
+            optuna_results_path = os.path.join(model_dir, "optuna_results.json")
+            if optuna_study and optuna_trials:
+                trial_results = []
+                for i, trial in enumerate(optuna_trials):
+                    trial_results.append({
+                        "trial": i+1,
+                        "score": trial.get("score", float("inf")),
+                        "params": {k: v for k, v in trial.get("params", {}).items()}
+                    })
+                with open(optuna_results_path, "w") as f:
+                    json.dump({"best_params": {k: v for k, v in params.items() if k not in ["tree_method", "verbosity", "random_state", "gpu_id"]},
+                              "trials": trial_results}, f, indent=2)
+                log_message(f"Saved Optuna results to {optuna_results_path}")
+        except ImportError:
+            log_message("Optuna not installed, skipping hyperparameter optimization")
+    
     if args.cv > 0:
         log_message(f"Performing {args.cv}-fold cross-validation")
         cv_models, cv_metrics = perform_cross_validation(

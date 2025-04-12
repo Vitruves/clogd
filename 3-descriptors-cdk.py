@@ -194,6 +194,8 @@ def parse_args():
                         help="Print additional debug information")
     parser.add_argument("--reliable-only", action="store_true",
                         help="Use only reliable descriptors known to work well with most molecules")
+    parser.add_argument("--minimal", action="store_true",
+                        help="Use only a minimal set of the most commonly used descriptors")
     parser.add_argument("--descriptor-timeout", type=int, default=5,
                         help="Maximum time (seconds) allowed for a single descriptor calculation")
     return parser.parse_args()
@@ -279,8 +281,8 @@ def get_reliable_descriptors():
         "XLogPDescriptor",        # XLogP
         "TPSADescriptor",         # TopoPSA
         "WeightDescriptor",       # MW (molecular weight)
-        "APolDescriptor",         # Atomic polarizability
-        "BPolDescriptor",         # Bond polarizability
+        "ApolDescriptor",         # apol (atomic polarizability)
+        "BPolDescriptor",         # bpol (bond polarizability)
         "FractionalCSP3Descriptor", # Fsp3
         "FractionalPSADescriptor", # tpsaEfficiency
         "ZagrebIndexDescriptor",  # Zagreb
@@ -292,12 +294,35 @@ def get_reliable_descriptors():
         "RotatableBondsCountDescriptor", # nRotB
         "HBondDonorCountDescriptor", # nHBDon
         "HBondAcceptorCountDescriptor", # nHBAcc
+        "VABCDescriptor",         # VABC (volume descriptor)
+        "VAdjMaDescriptor",       # VAdjMat
+        "PetitjeanNumberDescriptor", # PetitjeanNumber
+        "KierHallSmartsDescriptor", # khs.*
+        "BCUTDescriptor",         # BCUT.*
+        "SmallRingDescriptor",    # nRings*
+        "AromaticAtomsCountDescriptor", # naAromAtom
+        "AromaticBondsCountDescriptor", # nAromBond
+        "WienerNumbersDescriptor", # WPATH, WPOL
+        "CarbonTypesDescriptor"   # C*SP*
+    ]
+
+def get_minimal_descriptors():
+    """Returns a minimal set of descriptors that are most commonly used"""
+    return [
+        "ALOGPDescriptor",        # ALogP, ALogp2, AMR
+        "XLogPDescriptor",        # XLogP
+        "TPSADescriptor",         # TopoPSA
+        "WeightDescriptor",       # MW (molecular weight)
+        "RotatableBondsCountDescriptor", # nRotB
+        "HBondDonorCountDescriptor", # nHBDon
+        "HBondAcceptorCountDescriptor", # nHBAcc
+        "FractionalCSP3Descriptor", # Fsp3
     ]
 
 def process_chunk(chunk_data):
     """Process a chunk of molecules in a separate process"""
     try:
-        chunk_id, data, output_path, is_csv, smiles_col_idx, delimiter, descriptor_filter, descriptor_type, param_settings, reliable_only, descriptor_timeout = chunk_data
+        chunk_id, data, output_path, is_csv, smiles_col_idx, delimiter, descriptor_filter, descriptor_type, param_settings, reliable_only, minimal_only, descriptor_timeout = chunk_data
 
         # Each process needs its own JVM
         if not jpype.isJVMStarted():
@@ -317,7 +342,9 @@ def process_chunk(chunk_data):
             from org.openscience.cdk.smiles import SmilesParser
             from org.openscience.cdk.tools import CDKHydrogenAdder
             from org.openscience.cdk.qsar import DescriptorEngine
-            from java.lang import Class
+            from org.openscience.cdk.geometry import GeometryUtil
+            from org.openscience.cdk.modeling.builder3d import ModelBuilder3D
+            from java.lang import Class, System
             print(f"-- Worker {chunk_id}: CDK classes imported successfully")
         except Exception as e:
             print(f"-- Worker {chunk_id}: Error importing CDK classes: {e}")
@@ -329,6 +356,28 @@ def process_chunk(chunk_data):
             builder = SilentChemObjectBuilder.getInstance()
             parser = SmilesParser(builder)
             h_adder = CDKHydrogenAdder.getInstance(builder)
+            
+            # Set up aromaticity detection
+            print(f"-- Worker {chunk_id}: Setting up aromaticity model")
+            from org.openscience.cdk.aromaticity import Aromaticity
+            from org.openscience.cdk.graph import Cycles
+            from org.openscience.cdk.tools.manipulator import AtomContainerManipulator
+
+            # Try both import paths for ElectronDonation
+            try:
+                from org.openscience.cdk.aromaticity.ElectronDonation import Daylight
+                daylight_donator = Daylight()
+            except ImportError:
+                try:
+                    from org.openscience.cdk.aromaticity import ElectronDonation
+                    daylight_donator = ElectronDonation.daylight()
+                except ImportError:
+                    from org.openscience.cdk.aromaticity import ElectronDonation
+                    daylight_donator = ElectronDonation.cdk()
+                    
+            # Create aromaticity model with cycle finder
+            cycles = Cycles.all()
+            aromaticity_model = Aromaticity(daylight_donator, cycles)
             
             # Get descriptor engine based on type
             interface_class = None
@@ -351,30 +400,18 @@ def process_chunk(chunk_data):
             traceback.print_exc()
             return None
 
-        try:
-            # Try both import paths for ElectronDonation
-            print(f"-- Worker {chunk_id}: Setting up aromaticity model")
-            try:
-                from org.openscience.cdk.aromaticity.ElectronDonation import Daylight
-                daylight_donator = Daylight()
-            except ImportError:
-                try:
-                    from org.openscience.cdk.aromaticity import ElectronDonation
-                    daylight_donator = ElectronDonation.daylight()
-                except ImportError:
-                    from org.openscience.cdk.aromaticity import ElectronDonation
-                    daylight_donator = ElectronDonation.cdk()
-
-            from org.openscience.cdk.aromaticity import Aromaticity
-            from org.openscience.cdk.graph import Cycles
-            from org.openscience.cdk.tools.manipulator import AtomContainerManipulator
-        except Exception as e:
-            print(f"-- Worker {chunk_id}: Error importing aromaticity classes: {e}")
-            traceback.print_exc()
-            return None
-
         # Filter descriptors if specified
-        if reliable_only:
+        if minimal_only:
+            print(f"-- Worker {chunk_id}: Using minimal descriptors only")
+            minimal_list = get_minimal_descriptors()
+            descriptors = [d for d in all_descriptors if any(rel.lower() in d.getClass().getName().lower() for rel in minimal_list)]
+            print(f"-- Worker {chunk_id}: Selected {len(descriptors)} minimal descriptors")
+            
+            # Print which descriptors were selected
+            if len(descriptors) > 0:
+                desc_names = [d.getClass().getName().split('.')[-1] for d in descriptors]
+                print(f"-- Worker {chunk_id}: Selected descriptors: {', '.join(desc_names)}")
+        elif reliable_only:
             print(f"-- Worker {chunk_id}: Using reliable descriptors only")
             reliable_list = get_reliable_descriptors()
             descriptors = [d for d in all_descriptors if any(rel.lower() in d.getClass().getName().lower() for rel in reliable_list)]
@@ -407,62 +444,53 @@ def process_chunk(chunk_data):
         # Generate descriptor names for header
         print(f"-- Worker {chunk_id}: Generating descriptor names")
         descriptor_names = []
+        descriptor_meta = {}
+        
         for descriptor in descriptors:
             try:
+                desc_class = descriptor.getClass().getName().split('.')[-1]
                 desc_name = descriptor.getSpecification().getSpecificationReference().split('#')[-1]
+                
                 # Get parameter names for this descriptor
                 param_names = descriptor.getDescriptorNames()
                 if not param_names or len(param_names) == 0:
-                    descriptor_names.append(desc_name)
+                    col_name = desc_name 
+                    descriptor_names.append(col_name)
+                    descriptor_meta[col_name] = {'class': desc_class, 'index': len(descriptor_names)-1}
                 else:
                     for param in param_names:
-                        descriptor_names.append(f"{desc_name}.{param}")
+                        col_name = f"{desc_name}.{param}"
+                        descriptor_names.append(col_name)
+                        descriptor_meta[col_name] = {'class': desc_class, 'index': len(descriptor_names)-1}
             except Exception as desc_name_error:
                 print(f"-- Worker {chunk_id}: Error getting descriptor names: {desc_name_error}")
-                descriptor_names.append(f"Unknown.{len(descriptor_names)}")
+                unique_id = f"Unknown.{len(descriptor_names)}"
+                descriptor_names.append(unique_id)
+                descriptor_meta[unique_id] = {'class': 'Unknown', 'index': len(descriptor_names)-1}
         
+        # Save descriptor metadata for debugging
+        with open(f"{output_path}.meta", 'w') as mf:
+            json.dump(descriptor_meta, mf, indent=2)
+            
         print(f"-- Worker {chunk_id}: Created {len(descriptor_names)} descriptor columns")
-        
-        # Create aromaticity model
-        try:
-            print(f"-- Worker {chunk_id}: Creating aromaticity model")
-            aromaticity_model = Aromaticity(daylight_donator, Cycles.all())
-        except Exception as arom_error:
-            print(f"-- Worker {chunk_id}: Error creating aromaticity model: {arom_error}")
-            try:
-                from org.openscience.cdk.aromaticity import Kekulization
-                aromaticity_model = Aromaticity(daylight_donator, Cycles.all())
-            except Exception as arom_error2:
-                print(f"-- Worker {chunk_id}: Error creating alternative aromaticity model: {arom_error2}")
-                return None
-
-        # Process molecules and write directly to temp file
-        print(f"-- Worker {chunk_id}: Starting molecule processing")
-        total_mols = len(data)
-        processed_mols = 0
-        success_count = 0
-        error_count = 0
-        
-        # Track which descriptors fail the most
-        descriptor_errors = {desc.getClass().getName().split('.')[-1]: 0 for desc in descriptors}
         
         # Also save descriptor names to a separate file for this chunk
         with open(f"{output_path}.header", 'w') as hf:
             hf.write(delimiter.join(descriptor_names))
+            
+        # Track which descriptors fail the most
+        descriptor_errors = {desc.getClass().getName().split('.')[-1]: 0 for desc in descriptors}
             
         with open(output_path, 'w', newline='') as f:
             if is_csv:
                 # CSV processing - keep original columns if present
                 writer = csv.writer(f, delimiter=delimiter)
                 
-                # Write header with descriptor names
-                if chunk_id == 0:
-                    writer.writerow(descriptor_names)
-                
+                # Write chunk data with descriptor values
                 for idx, row in enumerate(data):
                     try:
-                        if idx % 100 == 0 or idx == total_mols - 1:
-                            print(f"-- Worker {chunk_id}: Processed {idx}/{total_mols} molecules")
+                        if idx % 100 == 0 or idx == len(data) - 1:
+                            print(f"-- Worker {chunk_id}: Processed {idx}/{len(data)} molecules")
                             
                         smiles = row[smiles_col_idx]
 
@@ -470,29 +498,38 @@ def process_chunk(chunk_data):
                             # Handle empty SMILES
                             row_data = ["ERROR"] * len(descriptor_names)
                             writer.writerow(row + row_data)
-                            error_count += 1
                             continue
 
-                        # Parse SMILES
+                        # Parse SMILES and prepare molecule properly
                         try:
                             mol = parser.parseSmiles(smiles)
-                        except Exception as smiles_error:
-                            print(f"-- Worker {chunk_id}: Error parsing SMILES '{smiles}': {smiles_error}")
-                            row_data = ["ERROR"] * len(descriptor_names)
-                            writer.writerow(row + row_data)
-                            error_count += 1
-                            continue
-
-                        # Configure atoms, add hydrogens, and detect aromaticity
-                        try:
+                            
+                            # Configure atoms
                             AtomContainerManipulator.percieveAtomTypesAndConfigureAtoms(mol)
+                            
+                            # Add explicit and implicit hydrogens
                             h_adder.addImplicitHydrogens(mol)
+                            
+                            # Detect aromaticity
                             aromaticity_model.apply(mol)
+                            
+                            try:
+                                # Try to generate 3D coordinates for 3D descriptors
+                                if not GeometryUtil.has3DCoordinates(mol):
+                                    try:
+                                        mb3d = ModelBuilder3D.getInstance()
+                                        mol = mb3d.generate3DCoordinates(mol, True)
+                                    except Exception as e_3d:
+                                        # Continue without 3D coordinates if generation fails
+                                        print(f"-- Worker {chunk_id}: Warning - Failed to generate 3D coords for {smiles}: {e_3d}")
+                            except Exception as e_geo:
+                                # Continue if GeometryUtil or 3D generation fails
+                                pass
+                                
                         except Exception as prep_error:
                             print(f"-- Worker {chunk_id}: Error preparing molecule '{smiles}': {prep_error}")
                             row_data = ["ERROR"] * len(descriptor_names)
                             writer.writerow(row + row_data)
-                            error_count += 1
                             continue
 
                         # Calculate all descriptors with timeout safety
@@ -532,59 +569,60 @@ def process_chunk(chunk_data):
 
                         # Write result with original row
                         writer.writerow(row + all_values)
-                        if desc_errors > 0:
-                            if desc_errors > len(descriptors) / 2:
-                                print(f"-- Worker {chunk_id}: {desc_errors} descriptor errors for molecule {idx}")
-                        success_count += 1
+                        if desc_errors > len(descriptors) / 2:
+                            print(f"-- Worker {chunk_id}: {desc_errors} descriptor errors for molecule {idx}")
                     except Exception as e:
                         # Handle any errors during calculation
                         print(f"-- Worker {chunk_id}: Error processing molecule {idx}: {e}")
                         if len(row) > 0:  # Make sure row exists
                             row_data = ["ERROR"] * len(descriptor_names)
                             writer.writerow(row + row_data)
-                        error_count += 1
-                    
-                    processed_mols += 1
             else:
                 # Simple SMILES list processing
                 writer = csv.writer(f, delimiter=delimiter)
                 
-                # Write header with descriptor names
-                if chunk_id == 0:
-                    writer.writerow(["SMILES"] + descriptor_names)
-                
+                # Write chunk data with descriptor values
                 for idx, smiles in enumerate(data):
                     try:
-                        if idx % 100 == 0 or idx == total_mols - 1:
-                            print(f"-- Worker {chunk_id}: Processed {idx}/{total_mols} molecules")
+                        if idx % 100 == 0 or idx == len(data) - 1:
+                            print(f"-- Worker {chunk_id}: Processed {idx}/{len(data)} molecules")
                             
                         if not smiles or pd.isna(smiles) or smiles == "":
                             # Handle empty SMILES
                             row_data = ["ERROR"] * len(descriptor_names)
                             writer.writerow([smiles] + row_data)
-                            error_count += 1
                             continue
 
                         # Parse SMILES
                         try:
                             mol = parser.parseSmiles(smiles)
-                        except Exception as smiles_error:
-                            print(f"-- Worker {chunk_id}: Error parsing SMILES '{smiles}': {smiles_error}")
-                            row_data = ["ERROR"] * len(descriptor_names)
-                            writer.writerow([smiles] + row_data)
-                            error_count += 1
-                            continue
-
-                        # Configure atoms, add hydrogens, and detect aromaticity
-                        try:
+                            
+                            # Configure atoms
                             AtomContainerManipulator.percieveAtomTypesAndConfigureAtoms(mol)
+                            
+                            # Add explicit and implicit hydrogens
                             h_adder.addImplicitHydrogens(mol)
+                            
+                            # Detect aromaticity 
                             aromaticity_model.apply(mol)
+                            
+                            try:
+                                # Try to generate 3D coordinates for 3D descriptors
+                                if not GeometryUtil.has3DCoordinates(mol):
+                                    try:
+                                        mb3d = ModelBuilder3D.getInstance()
+                                        mol = mb3d.generate3DCoordinates(mol, True)
+                                    except Exception as e_3d:
+                                        # Continue without 3D coordinates if generation fails
+                                        print(f"-- Worker {chunk_id}: Warning - Failed to generate 3D coords for {smiles}: {e_3d}")
+                            except Exception as e_geo:
+                                # Continue if GeometryUtil or 3D generation fails
+                                pass
+                                
                         except Exception as prep_error:
                             print(f"-- Worker {chunk_id}: Error preparing molecule '{smiles}': {prep_error}")
                             row_data = ["ERROR"] * len(descriptor_names)
                             writer.writerow([smiles] + row_data)
-                            error_count += 1
                             continue
 
                         # Calculate all descriptors with timeout safety
@@ -624,23 +662,19 @@ def process_chunk(chunk_data):
 
                         # Write result immediately
                         writer.writerow([smiles] + all_values)
-                        success_count += 1
                     except Exception as e:
                         row_data = ["ERROR"] * len(descriptor_names)
                         writer.writerow([smiles] + row_data)
-                        error_count += 1
-                        
-                    processed_mols += 1
 
         # Report descriptor error statistics
         print(f"-- Worker {chunk_id}: Descriptor error statistics:")
         sorted_errors = sorted(descriptor_errors.items(), key=lambda x: x[1], reverse=True)
         for desc_name, error_count in sorted_errors:
             if error_count > 0:
-                error_rate = (error_count / total_mols) * 100
+                error_rate = (error_count / len(data)) * 100
                 print(f"--   {desc_name}: {error_count} errors ({error_rate:.1f}%)")
 
-        print(f"-- Worker {chunk_id}: Completed - total: {total_mols}, processed: {processed_mols}, success: {success_count}, errors: {error_count}")
+        print(f"-- Worker {chunk_id}: Completed - total: {len(data)}, processed: {len(data)}")
         return output_path
     except Exception as e:
         print(f"-- Error in process_chunk: {e}")
@@ -712,8 +746,11 @@ def main():
                 descriptors = engine.getDescriptorInstances()
                 print(f"--   Found {len(descriptors)} molecular descriptors")
                 
-                # Print reliable descriptor list
-                if args.reliable_only:
+                # Print descriptor set info
+                if args.minimal:
+                    minimal_list = get_minimal_descriptors()
+                    print(f"--   Using minimal descriptors: {', '.join(minimal_list)}")
+                elif args.reliable_only:
                     reliable_list = get_reliable_descriptors()
                     print(f"--   Using reliable descriptors: {', '.join(reliable_list)}")
             except Exception as eng_err:
@@ -942,7 +979,7 @@ def main():
         output_path = os.path.join(temp_dir, f"chunk_{i}.csv")
         chunks.append((i, chunk_data, output_path, is_csv, smiles_col_idx, output_delimiter, 
                       args.descriptor_filter, args.descriptor_type, param_settings, 
-                      args.reliable_only, args.descriptor_timeout))
+                      args.reliable_only, args.minimal, args.descriptor_timeout))
 
     print(f"-- Processing {total_mols} molecules in {len(chunks)} chunks...")
 
@@ -966,65 +1003,67 @@ def main():
         # Combine results
         print("-- Combining results...")
 
-        # Try to collect all descriptor names from the first chunk's header file
-        descriptor_names = None
-        header_file = None
-        
-        if chunk_results:
-            # First look for a header file
-            for result_path in chunk_results:
-                header_path = f"{result_path}.header"
-                if os.path.exists(header_path):
-                    header_file = header_path
-                    with open(header_path, 'r') as f:
-                        header_content = f.read().strip()
-                        descriptor_names = header_content.split(output_delimiter)
-                    break
-                
-            # If no separate header file, try to read from the first chunk
-            if descriptor_names is None and len(chunk_results) > 0:
-                try:
-                    with open(chunk_results[0], 'r', newline='') as inf:
-                        reader = csv.reader(inf, delimiter=output_delimiter)
-                        try:
-                            descriptor_names = next(reader)
-                        except StopIteration:
-                            print("-- Warning: First chunk file is empty")
-                except Exception as e:
-                    print(f"-- Error reading descriptor header: {e}")
-                
-        if not descriptor_names:
-            print("-- Error: Could not determine descriptor names - failed")
-            sys.exit(1)
-
         with open(args.output, 'w', newline='') as outf:
             writer = csv.writer(outf, delimiter=output_delimiter)
-
-            # Write header
-            if is_csv and args.keep_original_cols:
-                # Include original columns from input file
-                if header:
-                    writer.writerow(header + descriptor_names)
-                else:
-                    writer.writerow(['Col_' + str(i) for i in range(len(data[0]))] + descriptor_names)
+            
+            # Construct final header
+            header_row = []
+            
+            # Add original columns if keeping them
+            if is_csv and args.keep_original_cols and header:
+                header_row.extend(header)
+            elif not is_csv:
+                header_row.append("SMILES")
+            
+            # Find and process descriptor header
+            descriptor_header = None
+            if chunk_results:
+                # First look for a header file
+                for result_path in chunk_results:
+                    header_path = f"{result_path}.header"
+                    if os.path.exists(header_path):
+                        with open(header_path, 'r') as f:
+                            header_content = f.read().strip()
+                            descriptor_header = header_content.split(output_delimiter)
+                        break
+                        
+                # If no separate header file, try to read from the first chunk
+                if descriptor_header is None and len(chunk_results) > 0:
+                    try:
+                        with open(chunk_results[0], 'r', newline='') as inf:
+                            reader = csv.reader(inf, delimiter=output_delimiter)
+                            try:
+                                # Skip original columns in first chunk if needed
+                                first_row = next(reader)
+                                if is_csv:
+                                    descriptor_header = first_row[len(data[0]):] if data and len(data[0]) > 0 else first_row
+                                else:
+                                    descriptor_header = first_row[1:] if len(first_row) > 1 else []
+                            except StopIteration:
+                                print("-- Warning: First chunk file is empty")
+                    except Exception as e:
+                        print(f"-- Error reading descriptor header: {e}")
+            
+            if descriptor_header:
+                header_row.extend(descriptor_header)
+                writer.writerow(header_row)
             else:
-                if is_csv:
-                    writer.writerow(descriptor_names)
-                else:
-                    writer.writerow(["SMILES"] + descriptor_names)
-
-            # Write data from chunks
+                print("-- Error: Could not determine descriptor names - failed")
+                sys.exit(1)
+            
+            # Write data rows from chunks
             rows_written = 0
             for result_path in chunk_results:
                 try:
                     with open(result_path, 'r', newline='') as inf:
                         reader = csv.reader(inf, delimiter=output_delimiter)
                         
-                        # Skip header in each chunk
-                        try:
-                            next(reader)
-                        except StopIteration:
-                            continue
+                        # Skip header row of chunk if present
+                        if not is_csv and os.path.basename(result_path).startswith("chunk_0"):
+                            try:
+                                next(reader)
+                            except StopIteration:
+                                continue
                             
                         for row in reader:
                             if not args.skip_errors or "ERROR" not in row:
